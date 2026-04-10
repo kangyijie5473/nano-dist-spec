@@ -1,0 +1,48 @@
+# nano-dist-spec Project Rules
+
+## Project Overview
+nano-dist-spec is a minimal (~2000 lines) distributed inference + speculative decoding framework for LLM, designed as an educational project for LLM infrastructure engineer interviews.
+
+## Architecture
+- `nano_dist_spec/config.py` — Model/cache/scheduler/speculative configuration dataclasses
+- `nano_dist_spec/parallel.py` — Tensor parallelism primitives (ColumnParallel, RowParallel, VocabParallel, AllReduce)
+- `nano_dist_spec/attention.py` — RoPE, three attention paths (prefill / decode-paged / extend-verify)
+- `nano_dist_spec/model.py` — Transformer model (Llama/Qwen) with TP-aware layers + HuggingFace weight loading
+- `nano_dist_spec/kv_cache.py` — Paged KV cache: BlockAllocator, KVCache tensors, KVCacheManager (block tables, rollback)
+- `nano_dist_spec/sampling.py` — Temperature / top-k / top-p sampling + logits_to_probs utility
+- `nano_dist_spec/scheduler.py` — Continuous batching scheduler (WAITING → RUNNING → FINISHED)
+- `nano_dist_spec/speculative.py` — Speculative decoding: draft → verify → rejection sampling loop
+- `nano_dist_spec/engine.py` — LLMEngine (inference loop) + LLM (user-facing API)
+- `nano_dist_spec/worker.py` — Distributed worker entry point for `torchrun`
+
+## Code Conventions
+- Python 3.10+, type hints on all public functions
+- Use `@dataclass` for configuration and data containers
+- No unnecessary comments — comments explain **why**, not **what**
+- Keep educational value: docstrings should explain the algorithm / design decision, not narrate code
+- Tensor shapes documented in docstrings using `[batch, heads, seq_len, head_dim]` notation
+- All modules use relative imports within the package (`from .config import ...`)
+
+## Key Design Decisions
+- **TP strategy**: ColumnParallel for Q/K/V/gate/up projections, RowParallel for O/down projections — exactly 2 AllReduce per transformer block
+- **KV cache**: flat pre-allocated tensors `[total_slots, num_kv_heads, head_dim]` indexed by `slot_mapping`
+- **Attention modes**: auto-detected from `InputMetadata` — prefill (no block_tables), decode (block_tables + seq_len=1), extend (block_tables + seq_len>1)
+- **Speculative decoding**: saves target logits from previous step to verify first draft token; rolls back KV cache after rejection
+- **Weight loading**: explicit per-layer mapping from HuggingFace names, with TP-aware `tensor_split` on the correct dimension
+
+## Testing
+- Tests run on CPU with `tp_size=1`
+- `tests/test_parallel.py` — TP primitive shapes and composition
+- `tests/test_kv_cache.py` — Block allocation, slot mapping, rollback, read/write
+- `tests/test_speculative.py` — Rejection sampling correctness (greedy + stochastic)
+- Run: `python -m pytest tests/ -v`
+
+## Dependencies
+- torch >= 2.0
+- transformers (tokenizer + config)
+- safetensors (weight loading)
+
+## Model Support
+- Llama family (LLaMA 2/3, CodeLlama)
+- Qwen family (Qwen2, Qwen3)
+- Any decoder-only transformer with: RMSNorm, SwiGLU MLP, GQA, RoPE
