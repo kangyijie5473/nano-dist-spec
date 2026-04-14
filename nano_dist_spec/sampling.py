@@ -36,7 +36,7 @@ def sample(
     if params.temperature == 0:
         return logits.argmax(dim=-1)
 
-    logits = logits / params.temperature
+    logits = logits.float() / params.temperature
 
     if params.top_k > 0:
         logits = _top_k_filter(logits, params.top_k)
@@ -45,6 +45,8 @@ def sample(
         logits = _top_p_filter(logits, params.top_p)
 
     probs = F.softmax(logits, dim=-1)
+    probs = probs.clamp(min=0.0)
+    probs = probs / probs.sum(dim=-1, keepdim=True)
     return torch.multinomial(probs, num_samples=1).squeeze(-1)
 
 

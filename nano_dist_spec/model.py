@@ -43,9 +43,10 @@ class RMSNorm(nn.Module):
         self.eps = eps
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        orig_dtype = x.dtype
         variance = x.float().pow(2).mean(-1, keepdim=True)
         x = x * torch.rsqrt(variance + self.eps)
-        return (self.weight * x).to(x.dtype)
+        return (self.weight * x).to(orig_dtype)
 
 
 class Attention(nn.Module):
@@ -66,15 +67,15 @@ class Attention(nn.Module):
 
         self.q_proj = ColumnParallelLinear(
             config.hidden_size, config.num_attention_heads * config.head_dim,
-            tp_size=tp_size,
+            bias=config.attention_bias, tp_size=tp_size,
         )
         self.k_proj = ColumnParallelLinear(
             config.hidden_size, config.num_key_value_heads * config.head_dim,
-            tp_size=tp_size,
+            bias=config.attention_bias, tp_size=tp_size,
         )
         self.v_proj = ColumnParallelLinear(
             config.hidden_size, config.num_key_value_heads * config.head_dim,
-            tp_size=tp_size,
+            bias=config.attention_bias, tp_size=tp_size,
         )
         self.o_proj = RowParallelLinear(
             config.num_attention_heads * config.head_dim, config.hidden_size,
@@ -250,6 +251,12 @@ class TransformerModel(nn.Module):
                 if tp_size > 1:
                     w = tensor_split(w, tp_rank, tp_size, dim=0)
                 getattr(layer.self_attn, name).linear.weight.data.copy_(w)
+                bias_key = f"{p}.self_attn.{name}.bias"
+                if bias_key in weights:
+                    b = weights[bias_key]
+                    if tp_size > 1:
+                        b = tensor_split(b, tp_rank, tp_size, dim=0)
+                    getattr(layer.self_attn, name).linear.bias.data.copy_(b)
 
             w = weights[f"{p}.self_attn.o_proj.weight"]
             if tp_size > 1:

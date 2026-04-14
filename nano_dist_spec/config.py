@@ -21,6 +21,7 @@ class ModelConfig:
     rope_theta: float = 10000.0
     head_dim: Optional[int] = None
     tie_word_embeddings: bool = False
+    attention_bias: bool = False
 
     def __post_init__(self):
         if self.head_dim is None:
@@ -44,6 +45,7 @@ class ModelConfig:
             rope_theta=raw.get("rope_theta", 10000.0),
             head_dim=raw.get("head_dim"),
             tie_word_embeddings=raw.get("tie_word_embeddings", False),
+            attention_bias=raw.get("attention_bias", True),
         )
 
 

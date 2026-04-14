@@ -17,7 +17,7 @@ def main():
     parser.add_argument("--top-p", type=float, default=0.9)
     args = parser.parse_args()
 
-    llm = LLM(args.model, dtype="float16")
+    llm = LLM(args.model, dtype="bfloat16")
 
     prompts = [
         "Explain distributed inference in one paragraph:",
