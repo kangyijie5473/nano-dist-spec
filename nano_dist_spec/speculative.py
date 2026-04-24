@@ -263,7 +263,17 @@ class SpeculativeDecoder:
                 break
 
         if all_accepted:
-            bonus = sample(target_probs_verify[K].unsqueeze(0), params).item()
+            # `target_probs_verify[K]` is already a proper (temperature-scaled)
+            # probability distribution. Passing it to `sample()` would softmax
+            # it AGAIN, which collapses any probability mass into a near-uniform
+            # distribution over the whole vocab — that's how we get random
+            # cross-language garbage tokens (Arabic, Russian, weird tags, etc.)
+            # leaking into otherwise coherent output.
+            bonus_probs = target_probs_verify[K]
+            if params.temperature == 0:
+                bonus = int(bonus_probs.argmax(dim=-1).item())
+            else:
+                bonus = int(torch.multinomial(bonus_probs, num_samples=1).item())
             accepted.append(bonus)
             tracer.on_spec_event("BONUS", token=bonus)
 
