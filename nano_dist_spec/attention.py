@@ -202,9 +202,17 @@ def extend_attention(
     prefix **plus** each other (causally).
 
     For a verify step with K draft tokens and prefix of length P:
-      - Q has K positions, full KV has P+K positions.
-      - PyTorch sdpa with `is_causal=True` applies an upper-left aligned
-        causal mask, which correctly lets token i attend to [0 .. P+i].
+      - Q has K positions (absolute positions [P, P+K)).
+      - Full KV has P+K positions (prefix from cache + K new from current step).
+      - Query i must attend to keys [0 .. P+i] (entire prefix + its own
+        position and all earlier draft positions).
+
+    We MUST NOT use `is_causal=True` here: PyTorch sdpa applies a top-left
+    aligned `tril` mask for rectangular Q/K, so query i would only see keys
+    [0..i] — i.e. only the first few prefix tokens. That silently destroys
+    verification quality (the target model ends up scoring draft tokens
+    against a truncated context). Instead we build a bottom-right aligned
+    mask explicitly.
 
     Args:
         q:  [1, num_heads, K, head_dim]
@@ -217,10 +225,9 @@ def extend_attention(
     Returns:
         output: [1, num_heads, K, head_dim]
     """
-    device, dtype = q.device, q.dtype
+    device = q.device
     prefix_len = prefix_lens[0].item()
-    num_kv_heads = k_new.shape[1]
-    head_dim = k_new.shape[-1]
+    K = k_new.shape[2]
 
     if prefix_len > 0:
         positions = torch.arange(prefix_len, device=device)
@@ -237,4 +244,10 @@ def extend_attention(
         v_full = v_new
 
     k_full, v_full = expand_kv_for_gqa(k_full, v_full, num_kv_groups)
-    return F.scaled_dot_product_attention(q, k_full, v_full, is_causal=True)
+
+    kv_len = k_full.shape[2]  # == prefix_len + K
+    q_idx = torch.arange(K, device=device).unsqueeze(1)       # [K, 1]
+    k_idx = torch.arange(kv_len, device=device).unsqueeze(0)  # [1, kv_len]
+    attn_mask = k_idx <= (prefix_len + q_idx)                 # [K, kv_len], True = attend
+
+    return F.scaled_dot_product_attention(q, k_full, v_full, attn_mask=attn_mask)
