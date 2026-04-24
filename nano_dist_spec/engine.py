@@ -15,6 +15,7 @@ from transformers import AutoTokenizer
 
 from .attention import InputMetadata
 from .config import CacheConfig, ModelConfig, SchedulerConfig, SpeculativeConfig
+from .debug import tracer
 from .kv_cache import BlockAllocator, KVCache, KVCacheManager
 from .model import TransformerModel
 from .sampling import SamplingParams, sample
@@ -154,6 +155,7 @@ class LLMEngine:
     def _prefill_seq(self, seq: Sequence, params: SamplingParams):
         ids = seq.prompt_token_ids
         seq_len = len(ids)
+        tracer.on_step("PREFILL", seq_id=seq.seq_id, prompt_len=seq_len)
 
         input_ids = torch.tensor([ids], device=self.device)
         positions = torch.arange(seq_len, device=self.device).unsqueeze(0)
@@ -170,6 +172,7 @@ class LLMEngine:
     def _decode_batch(self, seqs: List[Sequence], params: SamplingParams):
         seq_ids = [s.seq_id for s in seqs]
         tokens = [s.generated_token_ids[-1] for s in seqs]
+        tracer.on_step("DECODE", seq_ids=seq_ids, batch=len(seq_ids))
 
         for sid in seq_ids:
             self.kv_mgr.append_slots(sid, 1)
