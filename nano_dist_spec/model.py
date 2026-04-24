@@ -16,6 +16,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .config import ModelConfig
+from .debug import tracer
 from .parallel import (
     ColumnParallelLinear,
     RowParallelLinear,
@@ -57,9 +58,10 @@ class Attention(nn.Module):
       O projection        -> RowParallel    (AllReduce aggregates partials)
     """
 
-    def __init__(self, config: ModelConfig, tp_size: int = 1):
+    def __init__(self, config: ModelConfig, tp_size: int = 1, layer_idx: int = 0):
         super().__init__()
         self.tp_size = tp_size
+        self.layer_idx = layer_idx
         self.num_heads = config.num_attention_heads // tp_size
         self.num_kv_heads = config.num_key_value_heads // tp_size
         self.head_dim = config.head_dim
@@ -105,6 +107,8 @@ class Attention(nn.Module):
             v_flat = v.transpose(1, 2).contiguous().view(-1, self.num_kv_heads, self.head_dim)
             key_cache[metadata.slot_mapping] = k_flat
             value_cache[metadata.slot_mapping] = v_flat
+            if self.layer_idx == 0:
+                tracer.on_kv_write(self.layer_idx, metadata.slot_mapping.tolist())
 
         # --- Compute attention ---
         if metadata.is_prefill:
@@ -153,9 +157,10 @@ class MLP(nn.Module):
 
 
 class TransformerBlock(nn.Module):
-    def __init__(self, config: ModelConfig, tp_size: int = 1):
+    def __init__(self, config: ModelConfig, tp_size: int = 1, layer_idx: int = 0):
         super().__init__()
-        self.self_attn = Attention(config, tp_size)
+        self.layer_idx = layer_idx
+        self.self_attn = Attention(config, tp_size, layer_idx=layer_idx)
         self.mlp = MLP(config, tp_size)
         self.input_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
@@ -182,7 +187,10 @@ class TransformerModel(nn.Module):
             config.vocab_size, config.hidden_size, tp_size=tp_size,
         )
         self.layers = nn.ModuleList(
-            [TransformerBlock(config, tp_size) for _ in range(config.num_hidden_layers)]
+            [
+                TransformerBlock(config, tp_size, layer_idx=i)
+                for i in range(config.num_hidden_layers)
+            ]
         )
         self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.lm_head = ColumnParallelLinear(
