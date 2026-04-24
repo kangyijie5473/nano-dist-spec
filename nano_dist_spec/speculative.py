@@ -28,6 +28,7 @@ from typing import List, Optional, Tuple
 import torch
 
 from .attention import InputMetadata
+from .debug import tracer
 from .kv_cache import KVCache, KVCacheManager
 from .model import TransformerModel
 from .sampling import SamplingParams, logits_to_probs, sample
@@ -107,6 +108,17 @@ class SpeculativeDecoder:
         self.block_size = block_size
         self.device = next(target_model.parameters()).device
 
+        # Target and draft may have different padded vocab sizes (e.g. Qwen2.5-7B
+        # has 152064 while Qwen2.5-1.5B has 151936, both pad-to-multiple-of-N
+        # over the same underlying tokenizer). Rejection sampling compares
+        # p_target(x) against q_draft(x) element-wise, so both distributions
+        # must live on the same support. Truncate to min(target, draft): tokens
+        # beyond that index are padding slots never produced by the tokenizer
+        # and safe to drop.
+        self.shared_vocab_size = min(
+            target_model.config.vocab_size, draft_model.config.vocab_size,
+        )
+
     @torch.inference_mode()
     def prefill(
         self, seq_id: int, prompt_ids: torch.Tensor, params: SamplingParams,
@@ -114,21 +126,25 @@ class SpeculativeDecoder:
         """Prefill both models, return first token and saved target logits."""
         bsz, seq_len = prompt_ids.shape
         positions = torch.arange(seq_len, device=self.device).unsqueeze(0)
+        tracer.on_spec_event("PREFILL", seq_id=seq_id, prompt_len=seq_len)
 
         # --- Target prefill ---
+        tracer.on_spec_event("PREFILL_TARGET", seq_id=seq_id)
         slot_map_t = self.target_mgr.compute_slot_mapping(seq_id, 0, seq_len, self.device)
         meta_t = InputMetadata(slot_mapping=slot_map_t, block_size=self.block_size)
         kv_list_t = [self.target_kv.get_kv(i) for i in range(self.target_kv.num_layers)]
         target_logits = self.target(prompt_ids, positions, kv_list_t, meta_t)
 
         # --- Draft prefill ---
+        tracer.on_spec_event("PREFILL_DRAFT", seq_id=seq_id)
         slot_map_d = self.draft_mgr.compute_slot_mapping(seq_id, 0, seq_len, self.device)
         meta_d = InputMetadata(slot_mapping=slot_map_d, block_size=self.block_size)
         kv_list_d = [self.draft_kv.get_kv(i) for i in range(self.draft_kv.num_layers)]
         self.draft(prompt_ids, positions, kv_list_d, meta_d)
 
-        first_token = sample(target_logits[:, -1, :], params).item()
-        saved_probs = logits_to_probs(target_logits[:, -1, :], params.temperature)
+        target_last = target_logits[:, -1, : self.shared_vocab_size]
+        first_token = sample(target_last, params).item()
+        saved_probs = logits_to_probs(target_last, params.temperature)
         return first_token, saved_probs
 
     @torch.inference_mode()
@@ -147,6 +163,10 @@ class SpeculativeDecoder:
         """
         K = self.K
         prefix_len = self.target_mgr.context_lens[seq_id]
+        tracer.on_spec_event(
+            "STEP_BEGIN", seq_id=seq_id, prefix_len=prefix_len, K=K,
+            last_token=last_token,
+        )
 
         # =================================================================
         # 1. DRAFT: generate K candidate tokens autoregressively
@@ -157,6 +177,7 @@ class SpeculativeDecoder:
         current_token = last_token
         for i in range(K):
             pos = prefix_len + i
+            tracer.on_spec_event("DRAFT_ITER", iter=i, pos=pos, in_token=current_token)
             self.draft_mgr.append_slots(seq_id, 1)
             slot = self.draft_mgr.compute_slot_mapping(seq_id, pos, 1, self.device)
             bt = self.draft_mgr.get_block_table_tensor([seq_id], self.device)
@@ -171,15 +192,21 @@ class SpeculativeDecoder:
             kv_list = [self.draft_kv.get_kv(j) for j in range(self.draft_kv.num_layers)]
             draft_logits = self.draft(inp, pos_t, kv_list, meta)
 
-            probs = logits_to_probs(draft_logits[:, -1, :], params.temperature)
-            token = sample(draft_logits[:, -1, :], params).item()
+            draft_last = draft_logits[:, -1, : self.shared_vocab_size]
+            probs = logits_to_probs(draft_last, params.temperature)
+            token = sample(draft_last, params).item()
             draft_tokens.append(token)
             draft_probs_list.append(probs.squeeze(0))
             current_token = token
+        tracer.on_spec_event("DRAFT_DONE", tokens=draft_tokens)
 
         # =================================================================
         # 2. VERIFY: run target model on all K draft tokens at once
         # =================================================================
+        tracer.on_spec_event(
+            "VERIFY", seq_id=seq_id,
+            range=f"[{prefix_len},{prefix_len + K})", num_tokens=K,
+        )
         for i in range(K):
             self.target_mgr.append_slots(seq_id, 1)
 
@@ -204,7 +231,10 @@ class SpeculativeDecoder:
         target_probs_verify: List[torch.Tensor] = [saved_target_probs.squeeze(0)]
         for i in range(K):
             target_probs_verify.append(
-                logits_to_probs(target_logits[:, i, :], params.temperature).squeeze(0)
+                logits_to_probs(
+                    target_logits[:, i, : self.shared_vocab_size],
+                    params.temperature,
+                ).squeeze(0)
             )
 
         # =================================================================
@@ -223,14 +253,19 @@ class SpeculativeDecoder:
             )
             if ok:
                 accepted.append(draft_tokens[i])
+                tracer.on_spec_event("ACCEPT", pos=i, token=draft_tokens[i])
             else:
                 accepted.append(correction)
                 all_accepted = False
+                tracer.on_spec_event(
+                    "REJECT", pos=i, draft=draft_tokens[i], correction=correction,
+                )
                 break
 
         if all_accepted:
             bonus = sample(target_probs_verify[K].unsqueeze(0), params).item()
             accepted.append(bonus)
+            tracer.on_spec_event("BONUS", token=bonus)
 
         n_accepted = len(accepted)
         n_draft_accepted = K if all_accepted else (n_accepted - 1)
@@ -238,6 +273,12 @@ class SpeculativeDecoder:
         # =================================================================
         # 4. ROLL BACK rejected KV entries
         # =================================================================
+        tracer.on_spec_event(
+            "ROLLBACK", seq_id=seq_id,
+            target_to=prefix_len + n_draft_accepted,
+            draft_to=prefix_len,
+            n_draft_accepted=n_draft_accepted,
+        )
         # Target: keep prefix + n_draft_accepted tokens' KV
         self.target_mgr.rollback(seq_id, prefix_len + n_draft_accepted)
         # Draft: keep prefix only (we'll re-process accepted tokens next round)
@@ -246,6 +287,10 @@ class SpeculativeDecoder:
         # Resync draft model KV with accepted tokens
         if n_draft_accepted > 0:
             sync_tokens = accepted[:n_draft_accepted]
+            tracer.on_spec_event(
+                "RESYNC_DRAFT", seq_id=seq_id, n=n_draft_accepted,
+                tokens=sync_tokens,
+            )
             for i, tk in enumerate(sync_tokens):
                 pos = prefix_len + i
                 self.draft_mgr.append_slots(seq_id, 1)
@@ -265,6 +310,10 @@ class SpeculativeDecoder:
         # and produce saved probs for the next round
         last_accepted = accepted[-1]
         final_pos = prefix_len + n_draft_accepted
+        tracer.on_spec_event(
+            "FINAL", seq_id=seq_id, token=last_accepted, pos=final_pos,
+            accepted=accepted,
+        )
         self.target_mgr.append_slots(seq_id, 1)
         slot_f = self.target_mgr.compute_slot_mapping(seq_id, final_pos, 1, self.device)
         bt_f = self.target_mgr.get_block_table_tensor([seq_id], self.device)
@@ -295,7 +344,9 @@ class SpeculativeDecoder:
             kv_fd, meta_fd,
         )
 
-        new_saved = logits_to_probs(last_logits[:, -1, :], params.temperature)
+        new_saved = logits_to_probs(
+            last_logits[:, -1, : self.shared_vocab_size], params.temperature,
+        )
 
         output = SpeculativeOutput(
             accepted_tokens=accepted,
