@@ -16,6 +16,8 @@ from typing import Dict, List, Optional, Tuple
 
 import torch
 
+from .debug import tracer
+
 
 class BlockAllocator:
     """Free-list allocator for physical KV cache blocks."""
@@ -31,10 +33,13 @@ class BlockAllocator:
     def allocate(self) -> int:
         if not self.free_blocks:
             raise RuntimeError("KV cache out of blocks")
-        return self.free_blocks.pop()
+        block_id = self.free_blocks.pop()
+        tracer.on_allocate(block_id, len(self.free_blocks), self.num_blocks)
+        return block_id
 
     def free(self, block_id: int) -> None:
         self.free_blocks.append(block_id)
+        tracer.on_free(block_id, len(self.free_blocks), self.num_blocks)
 
 
 class KVCache:
@@ -100,6 +105,10 @@ class KVCacheManager:
         blocks = [self.allocator.allocate() for _ in range(num_blocks)]
         self.block_tables[seq_id] = blocks
         self.context_lens[seq_id] = num_tokens
+        tracer.on_allocate_seq(
+            seq_id, num_tokens, blocks,
+            self.allocator.num_free, self.allocator.num_blocks,
+        )
 
     def append_slots(self, seq_id: int, num_new: int = 1) -> None:
         """Ensure there are cache slots for *num_new* additional tokens."""
@@ -107,9 +116,18 @@ class KVCacheManager:
         new_len = old_len + num_new
         old_blocks = (old_len + self.block_size - 1) // self.block_size
         new_blocks = (new_len + self.block_size - 1) // self.block_size
+        last_new_block: Optional[int] = None
         for _ in range(new_blocks - old_blocks):
-            self.block_tables[seq_id].append(self.allocator.allocate())
+            blk = self.allocator.allocate()
+            self.block_tables[seq_id].append(blk)
+            last_new_block = blk
         self.context_lens[seq_id] = new_len
+        tracer.on_append_slots(
+            seq_id, old_len, new_len,
+            self.block_tables[seq_id], self.block_size,
+            last_new_block,
+            self.allocator.num_free, self.allocator.num_blocks,
+        )
 
     def rollback(self, seq_id: int, new_len: int) -> None:
         """Roll back a sequence's context to *new_len*, freeing tail blocks.
@@ -121,15 +139,30 @@ class KVCacheManager:
             return
         old_blocks = (old_len + self.block_size - 1) // self.block_size
         new_blocks = (new_len + self.block_size - 1) // self.block_size
+        freed: List[int] = []
         for i in range(new_blocks, old_blocks):
-            self.allocator.free(self.block_tables[seq_id][i])
+            blk = self.block_tables[seq_id][i]
+            self.allocator.free(blk)
+            freed.append(blk)
         self.block_tables[seq_id] = self.block_tables[seq_id][:new_blocks]
         self.context_lens[seq_id] = new_len
+        tracer.on_rollback(
+            seq_id, old_len, new_len, freed,
+            self.block_tables[seq_id],
+            self.allocator.num_free, self.allocator.num_blocks,
+        )
 
     def free_seq(self, seq_id: int) -> None:
+        freed: List[int] = []
         for blk in self.block_tables.pop(seq_id, []):
             self.allocator.free(blk)
+            freed.append(blk)
         self.context_lens.pop(seq_id, None)
+        if freed:
+            tracer.on_free_seq(
+                seq_id, freed,
+                self.allocator.num_free, self.allocator.num_blocks,
+            )
 
     # ------------------------------------------------------------------
     # Compute tensors consumed by attention kernels
@@ -145,6 +178,10 @@ class KVCacheManager:
             blk_off = pos % self.block_size
             phys = self.block_tables[seq_id][blk_idx]
             slots.append(phys * self.block_size + blk_off)
+        tracer.on_slot_mapping(
+            seq_id, start_pos, num_tokens, slots,
+            self.block_tables[seq_id], self.block_size,
+        )
         return torch.tensor(slots, dtype=torch.long, device=device)
 
     def get_block_table_tensor(

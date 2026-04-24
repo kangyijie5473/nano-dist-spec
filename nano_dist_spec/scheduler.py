@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import Deque, Dict, List, Optional
 
+from .debug import tracer
 from .kv_cache import KVCacheManager
 
 
@@ -70,6 +71,7 @@ class Scheduler:
             max_tokens=max_tokens,
         )
         self.waiting.append(seq)
+        tracer.on_add_request(seq_id, prompt_token_ids, max_tokens)
         return seq_id
 
     def schedule(self) -> SchedulerOutput:
