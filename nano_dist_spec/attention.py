@@ -153,22 +153,21 @@ def decode_paged_attention(
     """
     batch_size, num_heads, _, head_dim = q.shape
     num_kv_heads = num_heads // num_kv_groups
-    max_ctx = context_lens.max().item()
+    max_ctx = block_tables.shape[1] * block_size
     device, dtype = q.device, q.dtype
 
-    padded_k = torch.zeros(batch_size, max_ctx, num_kv_heads, head_dim,
-                           device=device, dtype=dtype)
-    padded_v = torch.zeros_like(padded_k)
+    # Vectorized gather over paged block tables. We intentionally avoid
+    # Tensor.item()/Python loops to keep this path CUDA-graph friendly.
+    positions = torch.arange(max_ctx, device=device, dtype=torch.long)
+    blk_idx = positions // block_size          # [max_ctx]
+    blk_off = positions % block_size           # [max_ctx]
+    blk_idx = blk_idx.unsqueeze(0).expand(batch_size, -1)  # [batch, max_ctx]
+    physical = torch.gather(block_tables, 1, blk_idx)      # [batch, max_ctx]
+    slots = physical * block_size + blk_off.unsqueeze(0)   # [batch, max_ctx]
 
-    for b in range(batch_size):
-        ctx = context_lens[b].item()
-        positions = torch.arange(ctx, device=device)
-        blk_idx = positions // block_size
-        blk_off = positions % block_size
-        physical = block_tables[b][blk_idx]
-        slots = physical * block_size + blk_off
-        padded_k[b, :ctx] = key_cache[slots]
-        padded_v[b, :ctx] = value_cache[slots]
+    flat_slots = slots.reshape(-1)
+    padded_k = key_cache[flat_slots].reshape(batch_size, max_ctx, num_kv_heads, head_dim)
+    padded_v = value_cache[flat_slots].reshape(batch_size, max_ctx, num_kv_heads, head_dim)
 
     # Transpose -> [batch, num_kv_heads, max_ctx, head_dim]
     k = padded_k.transpose(1, 2)
