@@ -8,7 +8,8 @@ Two modes:
 The engine coordinates model, KV cache, scheduler, and sampling.
 """
 
-from typing import List, Optional, Tuple
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
 
 import torch
 from transformers import AutoTokenizer
@@ -44,6 +45,7 @@ class LLMEngine:
         device: str = "cuda",
         cache_config: Optional[CacheConfig] = None,
         scheduler_config: Optional[SchedulerConfig] = None,
+        use_cuda_graph: bool = False,
     ):
         self.device = torch.device(device)
         self.dtype = dtype
@@ -57,6 +59,9 @@ class LLMEngine:
         self.model.to(device=self.device, dtype=self.dtype)
         self.model.load_weights(model_path)
         self.model.eval()
+        self.use_cuda_graph = use_cuda_graph
+        self._cuda_graph_enabled = use_cuda_graph
+        self._decode_graph_states: Dict[int, DecodeCudaGraphState] = {}
 
         self.tokenizer = AutoTokenizer.from_pretrained(
             model_path, trust_remote_code=True,
@@ -81,6 +86,134 @@ class LLMEngine:
             self.kv_mgr, max_num_seqs=self.scheduler_config.max_num_seqs,
         )
         self.block_size = block_size
+
+    def _prepare_decode_inputs(self, seqs: List[Sequence]) -> Tuple[
+        List[int],
+        torch.Tensor,
+        torch.Tensor,
+        InputMetadata,
+    ]:
+        """Build decode-step tensors from scheduler state."""
+        seq_ids = [s.seq_id for s in seqs]
+        tokens = [s.generated_token_ids[-1] for s in seqs]
+        for sid in seq_ids:
+            self.kv_mgr.append_slots(sid, 1)
+
+        input_ids = torch.tensor(tokens, device=self.device).unsqueeze(1)
+        positions_list = [self.kv_mgr.context_lens[s] - 1 for s in seq_ids]
+        positions = torch.tensor(positions_list, device=self.device).unsqueeze(1)
+
+        slot_list = []
+        for sid in seq_ids:
+            pos = self.kv_mgr.context_lens[sid] - 1
+            slot_list.append(self.kv_mgr.compute_slot_mapping(sid, pos, 1, self.device))
+        slot_mapping = torch.cat(slot_list)
+        block_tables = self.kv_mgr.get_block_table_tensor(seq_ids, self.device)
+        context_lens = self.kv_mgr.get_context_lens_tensor(seq_ids, self.device)
+        metadata = InputMetadata(
+            slot_mapping=slot_mapping,
+            block_tables=block_tables,
+            context_lens=context_lens,
+            block_size=self.block_size,
+        )
+        return seq_ids, input_ids, positions, metadata
+
+    def _run_forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        metadata: InputMetadata,
+    ) -> torch.Tensor:
+        kv_list = [self.kv_cache.get_kv(i) for i in range(self.kv_cache.num_layers)]
+        return self.model(input_ids, positions, kv_list, metadata)
+
+    @staticmethod
+    def _sample_and_commit(seqs: List[Sequence], logits: torch.Tensor, params: SamplingParams) -> None:
+        new_tokens = sample(logits[:, -1, :], params)
+        for i, seq in enumerate(seqs):
+            seq.generated_token_ids.append(new_tokens[i].item())
+
+    def _can_use_cuda_graph(self, seqs: List[Sequence], params: SamplingParams) -> bool:
+        if not self._cuda_graph_enabled:
+            return False
+        if not self.use_cuda_graph or self.device.type != "cuda" or not torch.cuda.is_available():
+            return False
+        if len(seqs) != 1:
+            return False
+        if params.temperature != 0 or params.top_k > 0 or params.top_p < 1.0:
+            return False
+        return True
+
+    def _get_decode_graph_state(self, seq: Sequence, params: SamplingParams) -> "DecodeCudaGraphState":
+        state = self._decode_graph_states.get(seq.seq_id)
+        if state is not None:
+            return state
+
+        max_ctx = len(seq.prompt_token_ids) + seq.max_tokens
+        max_blocks = (max_ctx + self.block_size - 1) // self.block_size
+        input_ids = torch.zeros((1, 1), dtype=torch.long, device=self.device)
+        positions = torch.zeros((1, 1), dtype=torch.long, device=self.device)
+        slot_mapping = torch.zeros((1,), dtype=torch.long, device=self.device)
+        block_tables = torch.zeros((1, max_blocks), dtype=torch.long, device=self.device)
+        context_lens = torch.zeros((1,), dtype=torch.long, device=self.device)
+        metadata = InputMetadata(
+            slot_mapping=slot_mapping,
+            block_tables=block_tables,
+            context_lens=context_lens,
+            block_size=self.block_size,
+        )
+
+        kv_list = [self.kv_cache.get_kv(i) for i in range(self.kv_cache.num_layers)]
+        warmup = torch.cuda.Stream(device=self.device)
+        with torch.cuda.stream(warmup):
+            for _ in range(2):
+                logits = self.model(input_ids, positions, kv_list, metadata)
+                _ = sample(logits[:, -1, :], params)
+        torch.cuda.current_stream(self.device).wait_stream(warmup)
+        torch.cuda.synchronize(self.device)
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            logits = self.model(input_ids, positions, kv_list, metadata)
+            next_tokens = sample(logits[:, -1, :], params)
+
+        state = DecodeCudaGraphState(
+            graph=graph,
+            input_ids=input_ids,
+            positions=positions,
+            slot_mapping=slot_mapping,
+            block_tables=block_tables,
+            context_lens=context_lens,
+            next_tokens=next_tokens,
+        )
+        self._decode_graph_states[seq.seq_id] = state
+        return state
+
+    def _decode_one_cuda_graph(self, seq: Sequence, params: SamplingParams) -> None:
+        sid = seq.seq_id
+        self.kv_mgr.append_slots(sid, 1)
+        pos = self.kv_mgr.context_lens[sid] - 1
+        state = self._get_decode_graph_state(seq, params)
+
+        state.input_ids[0, 0] = seq.generated_token_ids[-1]
+        state.positions[0, 0] = pos
+
+        blk_idx = pos // self.block_size
+        blk_off = pos % self.block_size
+        phys = self.kv_mgr.block_tables[sid][blk_idx]
+        state.slot_mapping[0] = phys * self.block_size + blk_off
+
+        table = self.kv_mgr.block_tables[sid]
+        if len(table) > state.block_tables.shape[1]:
+            raise RuntimeError("block table exceeded captured max shape")
+        state.block_tables.zero_()
+        if table:
+            state.block_tables[0, :len(table)] = torch.tensor(
+                table, dtype=torch.long, device=self.device
+            )
+        state.context_lens[0] = self.kv_mgr.context_lens[sid]
+        state.graph.replay()
+        seq.generated_token_ids.append(int(state.next_tokens[0].item()))
 
     def _estimate_num_blocks(self) -> int:
         """Estimate available KV cache blocks from free GPU memory."""
@@ -170,40 +303,20 @@ class LLMEngine:
         seq.generated_token_ids.append(token)
 
     def _decode_batch(self, seqs: List[Sequence], params: SamplingParams):
+        if self._can_use_cuda_graph(seqs, params):
+            try:
+                self._decode_one_cuda_graph(seqs[0], params)
+                return
+            except Exception as exc:
+                self._cuda_graph_enabled = False
+                self._decode_graph_states.clear()
+                print(f"[engine] cuda graph disabled, fallback to eager. error={exc}")
+
         seq_ids = [s.seq_id for s in seqs]
-        tokens = [s.generated_token_ids[-1] for s in seqs]
         tracer.on_step("DECODE", seq_ids=seq_ids, batch=len(seq_ids))
-
-        for sid in seq_ids:
-            self.kv_mgr.append_slots(sid, 1)
-
-        input_ids = torch.tensor(tokens, device=self.device).unsqueeze(1)
-        positions_list = [self.kv_mgr.context_lens[s] - 1 for s in seq_ids]
-        positions = torch.tensor(positions_list, device=self.device).unsqueeze(1)
-
-        slot_list = []
-        for sid in seq_ids:
-            pos = self.kv_mgr.context_lens[sid] - 1
-            slot_list.append(
-                self.kv_mgr.compute_slot_mapping(sid, pos, 1, self.device)
-            )
-        slot_mapping = torch.cat(slot_list)
-
-        block_tables = self.kv_mgr.get_block_table_tensor(seq_ids, self.device)
-        context_lens = self.kv_mgr.get_context_lens_tensor(seq_ids, self.device)
-
-        metadata = InputMetadata(
-            slot_mapping=slot_mapping,
-            block_tables=block_tables,
-            context_lens=context_lens,
-            block_size=self.block_size,
-        )
-        kv_list = [self.kv_cache.get_kv(i) for i in range(self.kv_cache.num_layers)]
-        logits = self.model(input_ids, positions, kv_list, metadata)
-
-        new_tokens = sample(logits[:, -1, :], params)
-        for i, seq in enumerate(seqs):
-            seq.generated_token_ids.append(new_tokens[i].item())
+        _, input_ids, positions, metadata = self._prepare_decode_inputs(seqs)
+        logits = self._run_forward(input_ids, positions, metadata)
+        self._sample_and_commit(seqs, logits, params)
 
 
 # ---------------------------------------------------------------------------
@@ -238,6 +351,7 @@ class LLM:
             dtype=dt,
             device=device,
             cache_config=cache_cfg,
+            use_cuda_graph=False,
         )
         self.draft_model_path = draft_model_path
         self.num_speculative_tokens = num_speculative_tokens
@@ -336,3 +450,14 @@ class LLM:
             results.append(GenerationOutput(prompt=prompt, text=text, token_ids=generated))
 
         return results
+
+
+@dataclass
+class DecodeCudaGraphState:
+    graph: torch.cuda.CUDAGraph
+    input_ids: torch.Tensor
+    positions: torch.Tensor
+    slot_mapping: torch.Tensor
+    block_tables: torch.Tensor
+    context_lens: torch.Tensor
+    next_tokens: torch.Tensor

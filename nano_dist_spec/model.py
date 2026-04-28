@@ -93,27 +93,62 @@ class Attention(nn.Module):
         kv_cache: Optional[Tuple[torch.Tensor, torch.Tensor]],
         metadata: InputMetadata,
     ) -> torch.Tensor:
+        q, k, v = self.compute_qkv(hidden, positions, cos, sin)
+        if kv_cache is not None:
+            self.write_kv_cache(k, v, kv_cache, metadata)
+        out = self.attend(q, k, v, kv_cache, metadata)
+        out = out.transpose(1, 2).contiguous().view(hidden.shape[0], hidden.shape[1], -1)
+        return self.o_proj(out)
+
+    def compute_qkv(
+        self,
+        hidden: torch.Tensor,
+        positions: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Project hidden states to Q/K/V and apply RoPE (stateless)."""
         bsz, seq_len, _ = hidden.shape
         q = self.q_proj(hidden).view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
         k = self.k_proj(hidden).view(bsz, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
         v = self.v_proj(hidden).view(bsz, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
-
         q, k = apply_rotary_emb(q, k, cos, sin, positions)
+        return q, k, v
 
-        # --- Write new KV to cache ---
-        if kv_cache is not None:
-            key_cache, value_cache = kv_cache
-            k_flat = k.transpose(1, 2).contiguous().view(-1, self.num_kv_heads, self.head_dim)
-            v_flat = v.transpose(1, 2).contiguous().view(-1, self.num_kv_heads, self.head_dim)
-            key_cache[metadata.slot_mapping] = k_flat
-            value_cache[metadata.slot_mapping] = v_flat
-            if self.layer_idx == 0:
-                tracer.on_kv_write(self.layer_idx, metadata.slot_mapping.tolist())
+    def write_kv_cache(
+        self,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        kv_cache: Tuple[torch.Tensor, torch.Tensor],
+        metadata: InputMetadata,
+    ) -> None:
+        """Persist current-step KV into the external cache (stateful)."""
+        key_cache, value_cache = kv_cache
+        k_flat = k.transpose(1, 2).contiguous().view(-1, self.num_kv_heads, self.head_dim)
+        v_flat = v.transpose(1, 2).contiguous().view(-1, self.num_kv_heads, self.head_dim)
+        key_cache[metadata.slot_mapping] = k_flat
+        value_cache[metadata.slot_mapping] = v_flat
+        if self.layer_idx == 0 and tracer.enabled:
+            tracer.on_kv_write(self.layer_idx, metadata.slot_mapping.tolist())
 
+    def attend(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        kv_cache: Optional[Tuple[torch.Tensor, torch.Tensor]],
+        metadata: InputMetadata,
+    ) -> torch.Tensor:
+        """Read from KV source and execute attention math (stateless wrt manager)."""
         # --- Compute attention ---
         if metadata.is_prefill:
-            out = prefill_attention(q, k, v, self.num_kv_groups)
-        elif seq_len == 1:
+            return prefill_attention(q, k, v, self.num_kv_groups)
+        if kv_cache is None:
+            raise ValueError("kv_cache is required for decode/extend attention paths")
+
+        key_cache, value_cache = kv_cache
+        seq_len = q.shape[2]
+        if seq_len == 1:
             out = decode_paged_attention(
                 q, key_cache, value_cache,
                 metadata.block_tables, metadata.context_lens,
@@ -127,9 +162,7 @@ class Attention(nn.Module):
                 metadata.block_tables, prefix_lens,
                 metadata.block_size, self.num_kv_groups,
             )
-
-        out = out.transpose(1, 2).contiguous().view(bsz, seq_len, -1)
-        return self.o_proj(out)
+        return out
 
 
 class MLP(nn.Module):
