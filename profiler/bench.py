@@ -120,7 +120,9 @@ def write_results(mode: str, payload: Dict[str, Any], out_dir: str) -> str:
 
 
 def bench_basic_one_run(
-    engine: LLMEngine, prompt_ids: List[int], max_tokens: int,
+    engine: LLMEngine,
+    prompt_ids: List[int],
+    max_tokens: int,
 ) -> Dict[str, Any]:
     """One pass of greedy prefill+decode, with TTFT split out from decode tps.
 
@@ -184,6 +186,7 @@ def run_basic(args) -> Dict[str, Any]:
         dtype=dt_map[args.dtype],
         device="cuda",
         cache_config=CacheConfig(num_gpu_blocks=args.num_gpu_blocks),
+        use_cuda_graph=args.cuda_graph,
     )
 
     prompt_ids = make_token_ids(tokenizer, args.prompt_len)
@@ -220,6 +223,7 @@ def run_basic(args) -> Dict[str, Any]:
             "dtype": args.dtype,
             "warmup": args.warmup,
             "runs": args.runs,
+            "cuda_graph": args.cuda_graph,
         },
         "results": runs,
         "summary": summary,
@@ -687,6 +691,8 @@ def build_parser() -> argparse.ArgumentParser:
     pb.add_argument("--warmup", type=int, default=1)
     pb.add_argument("--dtype", default="bfloat16", choices=["float16", "bfloat16"])
     pb.add_argument("--num-gpu-blocks", type=int, default=None)
+    pb.add_argument("--cuda-graph", action="store_true",
+                    help="enable engine CUDA Graph decode path (batch=1, greedy)")
 
     ps = sub.add_parser("spec", help="speculative decoding K-sweep")
     ps.add_argument("--target", required=True)
