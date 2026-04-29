@@ -224,8 +224,30 @@ def extend_attention(
     Returns:
         output: [1, num_heads, K, head_dim]
     """
+    if q.is_cuda and torch.cuda.is_current_stream_capturing():
+        return _extend_attention_cuda_graph_safe(
+            q, k_new, v_new, key_cache, value_cache,
+            block_tables, prefix_lens, block_size, num_kv_groups,
+        )
+    return _extend_attention_eager(
+        q, k_new, v_new, key_cache, value_cache,
+        block_tables, prefix_lens, block_size, num_kv_groups,
+    )
+
+
+def _extend_attention_eager(
+    q: torch.Tensor,
+    k_new: torch.Tensor,
+    v_new: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    block_tables: torch.Tensor,
+    prefix_lens: torch.Tensor,
+    block_size: int,
+    num_kv_groups: int,
+) -> torch.Tensor:
     device = q.device
-    prefix_len = prefix_lens[0].item()
+    prefix_len = int(prefix_lens[0].item())
     K = k_new.shape[2]
 
     if prefix_len > 0:
@@ -234,7 +256,7 @@ def extend_attention(
         blk_off = positions % block_size
         physical = block_tables[0][blk_idx]
         slots = physical * block_size + blk_off
-        k_prefix = key_cache[slots].transpose(0, 1).unsqueeze(0)   # [1, kv_heads, P, dim]
+        k_prefix = key_cache[slots].transpose(0, 1).unsqueeze(0)
         v_prefix = value_cache[slots].transpose(0, 1).unsqueeze(0)
         k_full = torch.cat([k_prefix, k_new], dim=2)
         v_full = torch.cat([v_prefix, v_new], dim=2)
@@ -244,9 +266,56 @@ def extend_attention(
 
     k_full, v_full = expand_kv_for_gqa(k_full, v_full, num_kv_groups)
 
-    kv_len = k_full.shape[2]  # == prefix_len + K
-    q_idx = torch.arange(K, device=device).unsqueeze(1)       # [K, 1]
-    k_idx = torch.arange(kv_len, device=device).unsqueeze(0)  # [1, kv_len]
-    attn_mask = k_idx <= (prefix_len + q_idx)                 # [K, kv_len], True = attend
+    kv_len = k_full.shape[2]
+    q_idx = torch.arange(K, device=device).unsqueeze(1)
+    k_idx = torch.arange(kv_len, device=device).unsqueeze(0)
+    attn_mask = k_idx <= (prefix_len + q_idx)
+
+    return F.scaled_dot_product_attention(q, k_full, v_full, attn_mask=attn_mask)
+
+
+def _extend_attention_cuda_graph_safe(
+    q: torch.Tensor,
+    k_new: torch.Tensor,
+    v_new: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    block_tables: torch.Tensor,
+    prefix_lens: torch.Tensor,
+    block_size: int,
+    num_kv_groups: int,
+) -> torch.Tensor:
+    """Same semantics as eager path but no host sync / Python shape branches."""
+    device = q.device
+    pl = prefix_lens[0]
+    K = k_new.shape[2]
+    num_blocks = block_tables.shape[1]
+    max_ctx = num_blocks * block_size
+
+    positions = torch.arange(max_ctx, device=device, dtype=torch.long)
+    in_prefix = positions < pl
+    blk_idx = positions // block_size
+    blk_off = positions % block_size
+    blk_idx_safe = blk_idx.clamp(max=num_blocks - 1)
+    physical = block_tables[0, blk_idx_safe]
+    slots = physical * block_size + blk_off
+    slots = torch.where(in_prefix, slots, torch.zeros_like(slots))
+
+    k_prefix = key_cache[slots].transpose(0, 1).unsqueeze(0)
+    v_prefix = value_cache[slots].transpose(0, 1).unsqueeze(0)
+    mask_keep = in_prefix.to(dtype=k_prefix.dtype).view(1, 1, max_ctx, 1)
+    k_prefix = k_prefix * mask_keep
+    v_prefix = v_prefix * mask_keep
+
+    k_full = torch.cat([k_prefix, k_new], dim=2)
+    v_full = torch.cat([v_prefix, v_new], dim=2)
+    k_full, v_full = expand_kv_for_gqa(k_full, v_full, num_kv_groups)
+
+    kv_len = k_full.shape[2]
+    q_idx = torch.arange(K, device=device).unsqueeze(1)
+    k_idx = torch.arange(kv_len, device=device).unsqueeze(0)
+    attend_prefix = (k_idx < max_ctx) & (k_idx < pl)
+    attend_draft = (k_idx >= max_ctx) & (k_idx < max_ctx + K) & ((k_idx - max_ctx) <= q_idx)
+    attn_mask = attend_prefix | attend_draft
 
     return F.scaled_dot_product_attention(q, k_full, v_full, attn_mask=attn_mask)

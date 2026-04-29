@@ -184,6 +184,49 @@ class KVCacheManager:
         )
         return torch.tensor(slots, dtype=torch.long, device=device)
 
+    def compute_slot_mapping_into(
+        self,
+        seq_id: int,
+        start_pos: int,
+        num_tokens: int,
+        out: torch.Tensor,
+    ) -> None:
+        """Write slot indices for [start_pos, start_pos + num_tokens) into ``out[:num_tokens]``."""
+        out_slice = out[:num_tokens]
+        slots: Optional[List[int]] = [] if tracer.enabled else None
+        for i, pos in enumerate(range(start_pos, start_pos + num_tokens)):
+            blk_idx = pos // self.block_size
+            blk_off = pos % self.block_size
+            phys = self.block_tables[seq_id][blk_idx]
+            slot = phys * self.block_size + blk_off
+            out_slice[i] = slot
+            if slots is not None:
+                slots.append(slot)
+        if tracer.enabled and slots is not None:
+            tracer.on_slot_mapping(
+                seq_id, start_pos, num_tokens, slots,
+                self.block_tables[seq_id], self.block_size,
+            )
+
+    def fill_block_table_padded(
+        self, seq_id: int, dest: torch.Tensor, max_blocks: int,
+    ) -> None:
+        """Fill ``dest[0, :max_blocks]`` with the sequence block table (zero-padded)."""
+        table = self.block_tables[seq_id]
+        if len(table) > max_blocks:
+            raise RuntimeError(
+                f"block table longer than captured max_blocks: "
+                f"len(table)={len(table)}, max_blocks={max_blocks}, "
+                f"context_len={self.context_lens.get(seq_id, '?')}"
+            )
+        n = len(table)
+        if n < max_blocks:
+            dest[0, n:max_blocks].zero_()
+        if n > 0:
+            dest[0, :n].copy_(
+                torch.tensor(table, dtype=torch.long, device=dest.device),
+            )
+
     def get_block_table_tensor(
         self, seq_ids: List[int], device: torch.device
     ) -> torch.Tensor:

@@ -45,7 +45,7 @@ class LLMEngine:
         device: str = "cuda",
         cache_config: Optional[CacheConfig] = None,
         scheduler_config: Optional[SchedulerConfig] = None,
-        use_cuda_graph: bool = False,
+        use_cuda_graph: bool = True,
     ):
         self.device = torch.device(device)
         self.dtype = dtype
@@ -342,6 +342,7 @@ class LLM:
         block_size: int = 16,
         draft_model_path: Optional[str] = None,
         num_speculative_tokens: int = 5,
+        max_seq_len: int = 4096,
     ):
         dt = {"float16": torch.float16, "bfloat16": torch.bfloat16, "float32": torch.float32}[dtype]
         cache_cfg = CacheConfig(block_size=block_size, num_gpu_blocks=num_gpu_blocks)
@@ -355,6 +356,7 @@ class LLM:
         )
         self.draft_model_path = draft_model_path
         self.num_speculative_tokens = num_speculative_tokens
+        self.max_seq_len = max_seq_len
         self._spec_decoder: Optional[SpeculativeDecoder] = None
 
         if draft_model_path:
@@ -392,6 +394,7 @@ class LLM:
             draft_kv_mgr=draft_mgr,
             num_speculative_tokens=K,
             block_size=block_size,
+            max_seq_len=self.max_seq_len,
         )
 
     def generate(

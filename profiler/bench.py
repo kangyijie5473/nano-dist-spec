@@ -248,6 +248,8 @@ def bench_spec_one_run(
 
     spec = llm._spec_decoder
     assert spec is not None, "spec decoder not initialized"
+    spec.reset_cuda_graph_runtime()
+
     eos_id = -1  # disable early stop
     seq_id = 0
     params = SamplingParams(temperature=temperature, max_tokens=max_tokens)
@@ -327,54 +329,65 @@ def run_spec(args) -> Dict[str, Any]:
     K_list = [int(k) for k in args.K_sweep.split(",") if k.strip()]
     temps = [float(t) for t in args.temperatures.split(",") if t.strip()]
 
-    # ---- Baseline: target-only autoregressive decode (for speedup ratio) ----
+    # ---- Baseline: target-only decode — eager vs CUDA Graph (for fair speedup) ----
     baseline: Dict[str, Any] = {}
     if args.baseline:
-        print("[spec] running target-only baseline")
-        baseline_engine = LLMEngine(
-            model_path=args.target,
-            tp_size=1,
-            dtype=torch.bfloat16,
-            device="cuda",
-            cache_config=CacheConfig(num_gpu_blocks=args.num_gpu_blocks),
-        )
-        for i in range(args.warmup):
-            print(f"[spec] baseline warmup {i + 1}/{args.warmup}")
-            bench_basic_one_run(baseline_engine, prompt_ids, args.max_tokens)
-        bruns = []
-        for i in range(args.runs):
-            r = bench_basic_one_run(baseline_engine, prompt_ids, args.max_tokens)
-            r["run"] = i
-            bruns.append(r)
-            print(
-                f"[spec] baseline run {i + 1}/{args.runs}  "
-                f"decode={r['decode_tps']:.1f} tok/s  "
-                f"ttft={r['ttft_s'] * 1000:.1f}ms"
+        baseline_modes = [
+            ("baseline_eager", False),
+            ("baseline_cuda_graph", True),
+        ]
+        for label, use_cg in baseline_modes:
+            if use_cg and not torch.cuda.is_available():
+                print(f"[spec] skip {label} (no CUDA)")
+                continue
+            cg_tag = "cuda_graph" if use_cg else "eager"
+            print(f"[spec] running target-only baseline ({cg_tag})")
+            baseline_engine = LLMEngine(
+                model_path=args.target,
+                tp_size=1,
+                dtype=torch.bfloat16,
+                device="cuda",
+                cache_config=CacheConfig(num_gpu_blocks=args.num_gpu_blocks),
+                use_cuda_graph=use_cg,
             )
-        baseline = {
-            "results": bruns,
-            "summary": {
-                "ttft_s": summarize([r["ttft_s"] for r in bruns]),
-                "decode_tps": summarize([r["decode_tps"] for r in bruns]),
-                "peak_mem_gb": summarize([r["peak_mem_gb"] for r in bruns]),
-            },
-        }
-        del baseline_engine
-        torch.cuda.empty_cache()
+            for i in range(args.warmup):
+                print(f"[spec]   {label} warmup {i + 1}/{args.warmup}")
+                bench_basic_one_run(baseline_engine, prompt_ids, args.max_tokens)
+            bruns = []
+            for i in range(args.runs):
+                r = bench_basic_one_run(baseline_engine, prompt_ids, args.max_tokens)
+                r["run"] = i
+                bruns.append(r)
+                print(
+                    f"[spec]   {label} run {i + 1}/{args.runs}  "
+                    f"decode={r['decode_tps']:.1f} tok/s  "
+                    f"ttft={r['ttft_s'] * 1000:.1f}ms"
+                )
+            baseline[label] = {
+                "use_cuda_graph": use_cg,
+                "results": bruns,
+                "summary": {
+                    "ttft_s": summarize([r["ttft_s"] for r in bruns]),
+                    "decode_tps": summarize([r["decode_tps"] for r in bruns]),
+                    "peak_mem_gb": summarize([r["peak_mem_gb"] for r in bruns]),
+                },
+            }
+            del baseline_engine
+            torch.cuda.empty_cache()
 
-    # Reuse a single LLM across the full sweep — only K changes between runs,
-    # and K lives on `_spec_decoder.K`. Temperature is purely a sampling param.
-    print("[spec] loading target+draft once for the full sweep")
-    llm = LLM(
-        args.target,
-        dtype="bfloat16",
-        num_gpu_blocks=args.num_gpu_blocks,
-        draft_model_path=args.draft,
-        num_speculative_tokens=max(K_list),
-    )
-
+    # Fresh LLM per temperature avoids CUDA graph / driver quirks when mixing
+    # greedy (graph-heavy) and stochastic sampling in one process.
     sweep: List[Dict[str, Any]] = []
     for temperature in temps:
+        print(f"[spec] loading target+draft for temperature={temperature}")
+        llm = LLM(
+            args.target,
+            dtype="bfloat16",
+            num_gpu_blocks=args.num_gpu_blocks,
+            draft_model_path=args.draft,
+            num_speculative_tokens=max(K_list),
+            max_seq_len=args.prompt_len + args.max_tokens + max(K_list) + 2,
+        )
         for K in K_list:
             print(f"[spec] === K={K}  temperature={temperature} ===")
             llm._spec_decoder.K = K
@@ -395,7 +408,6 @@ def run_spec(args) -> Dict[str, Any]:
                     f"tok/round={r['tokens_per_round']:.2f}  "
                     f"peak_mem={r['peak_mem_gb']:.2f}GB"
                 )
-
             entry = {
                 "K": K,
                 "temperature": temperature,
@@ -412,15 +424,46 @@ def run_spec(args) -> Dict[str, Any]:
                     "peak_mem_gb": summarize([r["peak_mem_gb"] for r in runs]),
                 },
             }
+            spec_tps = entry["summary"]["decode_tps"]["mean"]
             if baseline:
-                entry["speedup_vs_baseline"] = (
-                    entry["summary"]["decode_tps"]["mean"]
-                    / max(baseline["summary"]["decode_tps"]["mean"], 1e-6)
-                )
+                if "baseline_eager" in baseline:
+                    den_e = max(baseline["baseline_eager"]["summary"]["decode_tps"]["mean"], 1e-6)
+                    entry["speedup_vs_baseline_eager"] = spec_tps / den_e
+                if "baseline_cuda_graph" in baseline:
+                    den_g = max(
+                        baseline["baseline_cuda_graph"]["summary"]["decode_tps"]["mean"], 1e-6,
+                    )
+                    entry["speedup_vs_baseline_cuda_graph"] = spec_tps / den_g
+                if "baseline_eager" in baseline:
+                    entry["speedup_vs_baseline"] = entry["speedup_vs_baseline_eager"]
+                elif "baseline_cuda_graph" in baseline:
+                    entry["speedup_vs_baseline"] = entry["speedup_vs_baseline_cuda_graph"]
+                extra = []
+                if "speedup_vs_baseline_eager" in entry:
+                    extra.append(f"vs_tgt_eager={entry['speedup_vs_baseline_eager']:.2f}x")
+                if "speedup_vs_baseline_cuda_graph" in entry:
+                    extra.append(f"vs_tgt_graph={entry['speedup_vs_baseline_cuda_graph']:.2f}x")
+                if extra:
+                    print(f"[spec]   {'  '.join(extra)}")
             sweep.append(entry)
 
-    del llm
-    torch.cuda.empty_cache()
+        del llm
+        torch.cuda.empty_cache()
+
+    sweep_table: List[Dict[str, Any]] = []
+    for ent in sweep:
+        row: Dict[str, Any] = {
+            "K": ent["K"],
+            "temperature": ent["temperature"],
+            "decode_tps_mean": ent["summary"]["decode_tps"]["mean"],
+            "tokens_per_round_mean": ent["summary"]["tokens_per_round"]["mean"],
+            "draft_accept_rate_mean": ent["summary"]["draft_accept_rate"]["mean"],
+        }
+        if "speedup_vs_baseline_eager" in ent:
+            row["speedup_vs_baseline_eager"] = ent["speedup_vs_baseline_eager"]
+        if "speedup_vs_baseline_cuda_graph" in ent:
+            row["speedup_vs_baseline_cuda_graph"] = ent["speedup_vs_baseline_cuda_graph"]
+        sweep_table.append(row)
 
     return {
         "mode": "spec",
@@ -434,9 +477,11 @@ def run_spec(args) -> Dict[str, Any]:
             "warmup": args.warmup,
             "runs": args.runs,
             "num_gpu_blocks": args.num_gpu_blocks,
+            "llm_reload_per_temperature": len(temps) > 1,
         },
         "baseline": baseline,
         "sweep": sweep,
+        "sweep_table": sweep_table,
     }
 
 
