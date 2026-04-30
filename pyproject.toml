@@ -10,9 +10,13 @@ readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "torch>=2.0",
-    "transformers",
-    "safetensors",
+    "transformers>=4.36.0",
+    "safetensors>=0.4.0",
 ]
 
 [project.optional-dependencies]
 dev = ["pytest"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["nano_dist_spec*"]

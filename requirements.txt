@@ -1,3 +1,4 @@
+# Python >=3.10 (see pyproject.toml)
 torch>=2.0
-transformers
-safetensors
+transformers>=4.36.0
+safetensors>=0.4.0

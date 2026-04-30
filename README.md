@@ -4,6 +4,17 @@
 
 A from-scratch implementation designed for learning and demonstrating deep understanding of LLM inference infrastructure. Covers the two most interview-relevant topics in modern LLM serving: **Tensor Parallelism** and **Speculative Decoding**.
 
+## Installation
+
+From the repository root (see also `requirements.txt`):
+
+```bash
+pip install -e .
+# optional dev (pytest): pip install -e ".[dev]"
+```
+
+Legacy environments may use `python setup.py develop` for an editable install.
+
 ## Features
 
 | Feature | Description |
@@ -83,6 +94,26 @@ outputs = llm.generate(
     ["What is speculative decoding?"],
     SamplingParams(temperature=0.7, max_tokens=256),
 )
+```
+
+### Benchmark (Simple Defaults)
+
+```bash
+# basic: TTFT + decode TPS (warmup defaults to 1)
+python profiler/bench.py basic --model /path/to/model
+
+# spec: single-point run by default (K=5, temperature=0.0, baseline enabled)
+python profiler/bench.py spec --target /path/to/7B --draft /path/to/1.5B
+```
+
+### Benchmark (Advanced Sweep)
+
+```bash
+python profiler/bench.py spec \
+  --target /path/to/7B \
+  --draft /path/to/1.5B \
+  --K-sweep 3,5,7 \
+  --temperatures 0.0,0.7
 ```
 
 ## Core Concepts Explained
@@ -169,6 +200,12 @@ nano_dist_spec/
 
 ## Running Tests
 
+Install dev dependencies (includes pytest):
+
+```bash
+pip install -e ".[dev]"
+```
+
 ```bash
 python -m pytest tests/ -v
 
@@ -181,9 +218,8 @@ python tests/test_speculative.py
 ## Requirements
 
 - Python 3.10+
-- PyTorch 2.0+
-- Hugging Face Transformers
-- safetensors
+- PyTorch 2.0+, Hugging Face Transformers (>=4.36), safetensors (>=0.4) — see `requirements.txt` or `pip install -e .`
+- For tests: `pip install -e ".[dev]"` (pytest)
 - NVIDIA GPU with CUDA (for inference; tests run on CPU)
 
 ## License
