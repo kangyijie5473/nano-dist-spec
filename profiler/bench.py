@@ -4,7 +4,8 @@ Four modes, each emitting structured JSON to ``bench_results/`` for later
 post-processing into the resume tables:
 
     python bench.py basic --model <path> --prompt-len 128 --max-tokens 256
-    python bench.py spec  --target <7B> --draft <1.5B> --K-sweep 1,2,3,4,5,6,7,8
+    python bench.py spec  --target <7B> --draft <1.5B>
+    python bench.py spec  --target <7B> --draft <1.5B> --K-sweep 3,5,7 --temperatures 0.0,0.7
     python bench.py batch --model <path> --batch-sizes 1,2,4,8,16,32
     python bench.py kv-utilization --model <path>
 
@@ -326,8 +327,14 @@ def run_spec(args) -> Dict[str, Any]:
     prompt_ids = make_token_ids(tokenizer, args.prompt_len)
     print(f"[spec] prompt_len={len(prompt_ids)}  max_tokens={args.max_tokens}")
 
-    K_list = [int(k) for k in args.K_sweep.split(",") if k.strip()]
-    temps = [float(t) for t in args.temperatures.split(",") if t.strip()]
+    # Default path is intentionally simple: one K and one temperature.
+    # Advanced users can pass K-sweep / temperatures to override.
+    K_list = [args.K]
+    temps = [args.temperature]
+    if args.K_sweep is not None:
+        K_list = [int(k) for k in args.K_sweep.split(",") if k.strip()]
+    if args.temperatures is not None:
+        temps = [float(t) for t in args.temperatures.split(",") if t.strip()]
 
     # ---- Baseline: target-only decode — eager vs CUDA Graph (for fair speedup) ----
     baseline: Dict[str, Any] = {}
@@ -733,7 +740,8 @@ def build_parser() -> argparse.ArgumentParser:
     pb.add_argument("--prompt-len", type=int, default=128)
     pb.add_argument("--max-tokens", type=int, default=256)
     pb.add_argument("--runs", type=int, default=3)
-    pb.add_argument("--warmup", type=int, default=1)
+    pb.add_argument("--warmup", type=int, default=1,
+                    help="number of warmup runs before measurements (default: 1)")
     pb.add_argument("--dtype", default="bfloat16", choices=["float16", "bfloat16"])
     pb.add_argument("--num-gpu-blocks", type=int, default=None)
     pb.add_argument("--cuda-graph", action="store_true",
@@ -742,17 +750,24 @@ def build_parser() -> argparse.ArgumentParser:
     ps = sub.add_parser("spec", help="speculative decoding K-sweep")
     ps.add_argument("--target", required=True)
     ps.add_argument("--draft", required=True)
-    ps.add_argument("--K-sweep", default="5",
-                    help="comma-separated list of K values")
-    ps.add_argument("--temperatures", default="0.0",
-                    help="comma-separated list of temperatures to sweep")
+    ps.add_argument("--K", type=int, default=5,
+                    help="single speculative length K for default run")
+    ps.add_argument("--temperature", type=float, default=0.0,
+                    help="single temperature for default run")
+    ps.add_argument("--K-sweep", default=None,
+                    help="advanced: comma-separated list of K values (overrides --K)")
+    ps.add_argument("--temperatures", default=None,
+                    help="advanced: comma-separated list of temperatures (overrides --temperature)")
     ps.add_argument("--prompt-len", type=int, default=128)
     ps.add_argument("--max-tokens", type=int, default=128)
     ps.add_argument("--runs", type=int, default=3)
-    ps.add_argument("--warmup", type=int, default=1)
+    ps.add_argument("--warmup", type=int, default=1,
+                    help="number of warmup runs before measurements (default: 1)")
     ps.add_argument("--num-gpu-blocks", type=int, default=4000)
-    ps.add_argument("--baseline", action="store_true",
-                    help="also run target-only baseline for speedup")
+    ps.add_argument("--baseline", dest="baseline", action="store_true", default=True,
+                    help="run target-only baseline for speedup (default: enabled)")
+    ps.add_argument("--no-baseline", dest="baseline", action="store_false",
+                    help="disable target-only baseline")
 
     pba = sub.add_parser("batch", help="continuous-batching throughput sweep")
     pba.add_argument("--model", required=True)
