@@ -30,3 +30,18 @@
 - [ ] **Benchmark Script** — `bench.py` with tokens/s, TTFT, acceptance rate, memory usage metrics
 - [ ] **Medusa/EAGLE-style Draft** — Single-model speculative decoding with extra prediction heads
 - [ ] **Request Preemption** — Swap out low-priority sequences when KV memory is exhausted
+
+## Benchmark Data Needed (简历数据填充)
+
+> 以下数据需要实验测量后填入 `docs/RESUME.md` 中的 `x` 占位符。
+
+- [ ] **单卡推理 tokens/s** — Qwen3-0.6B, fp16, max_tokens=256, batch_size=1 (RTX 4090 / A100)
+- [ ] **单卡推理 tokens/s** — Qwen3-1.7B, fp16, 同上
+- [ ] **TTFT (首 token 延迟)** — Qwen3-0.6B, prompt_len=128
+- [ ] **TTFT (首 token 延迟)** — Qwen3-1.7B, prompt_len=128
+- [ ] **投机解码加速比** — Qwen3-1.7B (target) + Qwen3-0.6B (draft), K=5, vs 标准推理
+- [ ] **投机解码接受率** — K=3/5/7, Qwen3-1.7B+0.6B, temperature=0 和 temperature=0.7
+- [ ] **投机解码 K 值扫描** — K=1,2,3,4,5,6,7,8 的加速比和接受率曲线
+- [ ] **TP scaling efficiency** — 2 卡/4 卡 TP 相对单卡的吞吐提升比例
+- [ ] **KV cache 显存利用率** — 分页 vs 连续分配 (可用 memory_bytes() 函数测量)
+- [ ] **连续批处理吞吐** — batch_size=1/4/16/64 下的总 tokens/s
