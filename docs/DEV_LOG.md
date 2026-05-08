@@ -644,3 +644,99 @@ python profiler/vllm_basic_match_bench.py \
 | vLLM KV 与 `max_model_len` | 长 `max_model_len` 会按「至少服务满上下文」预留 KV；4090 上 7B 需限制 `--max-model-len` 或提高 `gpu_memory_utilization` |
 | nano batch vs graph | `len(seqs)==1` 才启用 decode CUDA Graph；batch sweep 的 B≥2 无 graph 红利，与 basic 单流对比时要单独说明 |
 | 指标对齐 | basic 拆 TTFT / decode；batch 比生成吞吐时 vLLM 勿直接用 JSON 的 `tokens_per_second`（含 prompt） |
+
+---
+
+## 进展 #15: 基准工具精简与脚本化对齐（2026-05-08）
+
+**目标**: 将 `profiler/bench.py` 从大而全脚本收敛为面向当前需求的最小工具（仅 basic/spec），并补齐与 `vllm_benchmark.sh` 对齐的一键运行脚本。
+
+### 15.1 `bench.py` 重构（仅保留 basic/spec）
+
+**本次改动**:
+
+1. 删除 `batch` / `kv-utilization` 模式与相关 CLI、执行分支。
+2. 参数统一为 vLLM 语义：
+   - `--input-len`
+   - `--output-len`
+   - `--num-prompts`
+   - `--max-num-seqs`
+   - `--max-model-len`
+   - `--tensor-parallel-size`
+3. `spec` 收敛为单路径 K 扫描：`--k-values`（如 `1,2,3,4,5,6,7`），去掉历史双轨参数与分叉开关。
+4. 输出结构保留丰富指标，但主口径统一在 `throughput` 字段（`elapsed_s` / `request_throughput_rps` / `output_token_throughput_tps`）。
+
+**代码结构调整**:
+
+- `profiler/bench.py`：仅保留 CLI 与模式分发（轻量入口）。
+- `profiler/bench_core.py`：承载 basic/spec 的核心执行逻辑与指标汇总。
+
+**结果**:
+
+- `bench.py` 从千行级降到双位数行数（当前约 89 行）。
+- `python profiler/bench.py --help` 只显示 `{basic,spec}` 两个子命令，符合预期最小参数面。
+
+### 15.2 新增 `profiler/nano_benchmark.sh`
+
+为对齐 `profiler/vllm_benchmark.sh` 的使用体验，新增 nano 侧一键脚本：
+
+- 流程：`baseline` + `k=1..7` 扫描。
+- 变量风格与 vLLM 脚本保持一致（`TARGET_MODEL` / `DRAFT_MODEL` / `INPUT_LEN` / `OUTPUT_LEN` / `NUM_PROMPTS` 等）。
+- 调用路径：
+  - baseline: `python profiler/bench.py basic ...`
+  - spec: `python profiler/bench.py spec ... --k-values "${K}"`
+- 汇总方式：从每轮生成的 JSON 提取吞吐与 spec 指标（accept_rate / tokens_per_round / speedup_vs_baseline）写入 `summary.log` 并打印最终对比表。
+
+**校验**:
+
+- `bash -n profiler/nano_benchmark.sh` 通过。
+- 脚本已设置可执行权限：`chmod +x profiler/nano_benchmark.sh`。
+
+### 15.3 当前状态与下一步
+
+- 当前基准入口已统一为：
+  - 交互式命令：`profiler/bench.py`（basic/spec）
+  - 批量脚本：`profiler/nano_benchmark.sh`
+- 下一步可选项：
+  1. 给 `nano_benchmark.sh` 增加 `FAST_MODE`（小 `NUM_PROMPTS` + 小 `K_VALUES`）用于快速 smoke。
+  2. 追加 nano/vLLM 双脚本结果的同口径汇总 JSON，方便自动化对比与画图。
+
+---
+
+## 进展 #16: H10 机器 vLLM 基准复测（OSL=256 / 512）
+
+**背景**: 在 H10 机器上使用 `profiler/vllm_benchmark.sh` 连续跑了 2 轮，分别测试 `OUTPUT_LEN=256` 和 `OUTPUT_LEN=512`。以下记录按你提供的汇总值整理。
+
+### 16.1 OSL=256 结果
+
+| 配置 | requests/s | total tokens/s | output tokens/s | 相对 baseline（output） |
+|------|-----------:|---------------:|----------------:|------------------------:|
+| baseline | 0.19 | 71.21 | 47.47 | 1.00x |
+| spec_k1 | 0.25 | 97.24 | 64.83 | 1.37x |
+| spec_k2 | 0.29 | 113.27 | 75.51 | 1.59x |
+| spec_k3 | 0.31 | 118.83 | 79.22 | 1.67x |
+| spec_k4 | 0.32 | 120.97 | 80.65 | **1.70x** |
+| spec_k5 | 0.31 | 118.72 | 79.15 | 1.67x |
+| spec_k6 | 0.30 | 115.76 | 77.17 | 1.63x |
+| spec_k7 | 0.26 | 100.40 | 66.93 | 1.41x |
+
+### 16.2 OSL=512 结果
+
+| 配置 | requests/s | total tokens/s | output tokens/s | 相对 baseline（output） |
+|------|-----------:|---------------:|----------------:|------------------------:|
+| baseline | 0.09 | 59.65 | 47.72 | 1.00x |
+| spec_k1 | 0.13 | 83.70 | 66.96 | 1.40x |
+| spec_k2 | 0.15 | 98.23 | 78.59 | 1.65x |
+| spec_k3 | 0.16 | 105.29 | 84.23 | 1.77x |
+| spec_k4 | 0.17 | 108.50 | 86.80 | **1.82x** |
+| spec_k5 | 0.17 | 108.09 | 86.47 | 1.81x |
+| spec_k6 | 0.16 | 104.04 | 83.24 | 1.74x |
+| spec_k7 | 0.15 | 97.53 | 78.02 | 1.64x |
+
+### 16.3 结论摘要
+
+1. 两组 OSL 都呈现一致趋势：`K` 从 1 增长到 4 左右时吞吐提升明显，`K>=5` 后进入平台并在更大 K 出现回落。
+2. 当前最佳点都在 `K=4` 附近：
+   - `OSL=256`: `80.65 output tok/s`（约 `1.70x`）
+   - `OSL=512`: `86.80 output tok/s`（约 `1.82x`）
+3. baseline 的 output 吞吐在两组长度下接近（47.47 vs 47.72 tok/s），说明在当前配置下 target-only decode 稳态速度较稳定；spec 的收益主要体现在每轮接受更多 token 带来的有效前进速度提升。
