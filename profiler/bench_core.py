@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import asdict, dataclass
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import torch
 from transformers import AutoTokenizer
@@ -80,6 +80,7 @@ class SharedArgs:
     max_num_seqs: int
     max_model_len: int
     tensor_parallel_size: int
+    num_gpu_blocks: Optional[int] = None
 
     def validate(self, max_k: int = 0) -> None:
         if self.max_num_seqs != 1:
@@ -91,15 +92,19 @@ class SharedArgs:
             )
 
 
-def _build_target_engine(model_path: str, shared: SharedArgs) -> LLMEngine:
+def _build_target_engine(
+    model_path: str,
+    shared: SharedArgs,
+    use_cuda_graph: bool = True,
+) -> LLMEngine:
     return LLMEngine(
         model_path=model_path,
         tp_size=shared.tensor_parallel_size,
         dtype=torch.bfloat16,
         device="cuda",
-        cache_config=CacheConfig(),
+        cache_config=CacheConfig(num_gpu_blocks=shared.num_gpu_blocks),
         scheduler_config=SchedulerConfig(max_num_seqs=shared.max_num_seqs),
-        use_cuda_graph=False,
+        use_cuda_graph=use_cuda_graph,
     )
 
 
@@ -346,23 +351,12 @@ def run_spec(
     tokenizer = AutoTokenizer.from_pretrained(target_model, trust_remote_code=True)
     prompt_ids = make_token_ids(tokenizer, shared.input_len)
 
-    baseline_engine = _build_target_engine(target_model, shared)
-    baseline = _bench_basic_prompt_set(
-        engine=baseline_engine,
-        prompt_ids=prompt_ids,
-        output_len=shared.output_len,
-        num_prompts=shared.num_prompts,
-    )
-    baseline_tps = max(
-        baseline["throughput"]["output_token_throughput_tps"],
-        1e-6,
-    )
-
     llm = LLM(
         model_path=target_model,
         tensor_parallel_size=shared.tensor_parallel_size,
         dtype="bfloat16",
         device="cuda",
+        num_gpu_blocks=shared.num_gpu_blocks,
         draft_model_path=draft_model,
         num_speculative_tokens=max_k,
         max_seq_len=shared.max_model_len,
@@ -377,9 +371,6 @@ def run_spec(
             output_len=shared.output_len,
             num_prompts=shared.num_prompts,
         )
-        result["speedup_vs_baseline"] = (
-            result["throughput"]["output_token_throughput_tps"] / baseline_tps
-        )
         sweep.append(result)
 
     return {
@@ -390,6 +381,5 @@ def run_spec(
             **asdict(shared),
             "k_values": k_values,
         },
-        "baseline": baseline,
         "sweep": sweep,
     }

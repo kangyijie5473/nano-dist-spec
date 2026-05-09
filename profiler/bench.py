@@ -31,6 +31,7 @@ def add_shared_cli_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--max-num-seqs", type=int, default=1)
     parser.add_argument("--max-model-len", type=int, default=2048)
     parser.add_argument("--tensor-parallel-size", type=int, default=1)
+    parser.add_argument("--num-gpu-blocks", type=int, default=None)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -59,6 +60,7 @@ def to_shared_args(args: argparse.Namespace) -> SharedArgs:
         max_num_seqs=args.max_num_seqs,
         max_model_len=args.max_model_len,
         tensor_parallel_size=args.tensor_parallel_size,
+        num_gpu_blocks=args.num_gpu_blocks,
     )
 
 

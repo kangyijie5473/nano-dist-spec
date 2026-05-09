@@ -1,21 +1,22 @@
 #!/bin/bash
 # ============================================================
 # nano-dist-spec speculative decoding benchmark script
-# 依次跑: baseline + k=1,2,3,4,5,6,7
+# 依次跑: baseline（单独 basic）+ spec（仅吞吐与投机指标；加速比请用 baseline JSON 自行对比）
 # ============================================================
 
 set -u
 
 # ---------- 可配置参数 ----------
-TARGET_MODEL="/model/HuggingFace/deepseek-ai/DeepSeek-R1-Distill-Qwen-32B"
-DRAFT_MODEL="/model/HuggingFace/deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"
+TARGET_MODEL="/model/HuggingFace/deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"
+DRAFT_MODEL="/model/HuggingFace/deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
 
 INPUT_LEN=128
 OUTPUT_LEN=256
-NUM_PROMPTS=50
+NUM_PROMPTS=5
 MAX_NUM_SEQS=1
 MAX_MODEL_LEN=2048
 TP_SIZE=1
+NUM_GPU_BLOCKS=128
 
 # k 值扫描范围
 K_VALUES=(1 2 3 4 5 6 7)
@@ -115,7 +116,6 @@ tps = tp.get("output_token_throughput_tps", 0.0)
 elapsed = tp.get("elapsed_s", 0.0)
 accept = row.get("draft_accept_rate", 0.0)
 tokens_per_round = row.get("tokens_per_round", 0.0)
-speedup = row.get("speedup_vs_baseline", 0.0)
 
 print(
     "Throughput: "
@@ -126,8 +126,7 @@ print(
 print(
     "SpecDecoding: "
     f"accept_rate={accept:.4%}, "
-    f"tokens_per_round={tokens_per_round:.4f}, "
-    f"speedup_vs_baseline={speedup:.4f}x"
+    f"tokens_per_round={tokens_per_round:.4f}"
 )
 PY
 }
@@ -139,6 +138,7 @@ log_summary "Target: ${TARGET_MODEL}"
 log_summary "Draft:  ${DRAFT_MODEL}"
 log_summary "input_len=${INPUT_LEN}, output_len=${OUTPUT_LEN}, num_prompts=${NUM_PROMPTS}"
 log_summary "max_num_seqs=${MAX_NUM_SEQS}, tp=${TP_SIZE}, max_model_len=${MAX_MODEL_LEN}"
+log_summary "num_gpu_blocks=${NUM_GPU_BLOCKS}"
 log_summary "log_dir=${LOG_DIR}"
 log_summary "============================================================"
 
@@ -156,6 +156,7 @@ python "${BENCH_PY}" --out-dir "${OUT_DIR}" basic \
     --max-num-seqs "${MAX_NUM_SEQS}" \
     --max-model-len "${MAX_MODEL_LEN}" \
     --tensor-parallel-size "${TP_SIZE}" \
+    --num-gpu-blocks "${NUM_GPU_BLOCKS}" \
     > "${BASELINE_LOG}" 2>&1
 
 BASELINE_EXIT=$?
@@ -185,6 +186,7 @@ for K in "${K_VALUES[@]}"; do
         --max-model-len "${MAX_MODEL_LEN}" \
         --tensor-parallel-size "${TP_SIZE}" \
         --k-values "${K}" \
+        --num-gpu-blocks "${NUM_GPU_BLOCKS}" \
         > "${SPEC_LOG}" 2>&1
 
     SPEC_EXIT=$?
