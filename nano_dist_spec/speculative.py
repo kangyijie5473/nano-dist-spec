@@ -155,7 +155,7 @@ class SpeculativeDecoder:
         self._resync_pos = torch.zeros((1, cap), dtype=torch.long, device=self.device)
         self._resync_slots = torch.zeros((cap,), dtype=torch.long, device=self.device)
 
-        # CUDA Graph caches — target keyed by k (seq_len), draft keyed by seq_id.
+        # CUDA Graph caches — keyed by seq_len.
         self._target_graphs: Dict[int, _CudaGraphState] = {}
         self._draft_graphs: Dict[int, _CudaGraphState] = {}
 
@@ -241,17 +241,19 @@ class SpeculativeDecoder:
         self._target_graphs[k] = st
         return st
 
-    def _get_draft_graph(self, seq_id: int, params: SamplingParams) -> _CudaGraphState:
-        st = self._draft_graphs.get(seq_id)
+    def _get_draft_graph(self, seq_len: int, params: SamplingParams) -> _CudaGraphState:
+        st = self._draft_graphs.get(seq_len)
         if st is not None:
             return st
-        st = self._build_graph(
-            self.draft, self._kv_list_draft, 1,
-            warmup_extra=lambda logits: sample(
+        warmup_extra = None
+        if seq_len == 1:
+            warmup_extra = lambda logits: sample(
                 logits[:, -1, : self.shared_vocab_size], params,
-            ),
+            )
+        st = self._build_graph(
+            self.draft, self._kv_list_draft, seq_len, warmup_extra=warmup_extra,
         )
-        self._draft_graphs[seq_id] = st
+        self._draft_graphs[seq_len] = st
         return st
 
     # ------------------------------------------------------------------
@@ -364,88 +366,107 @@ class SpeculativeDecoder:
         if pos_actual != pos:
             raise RuntimeError(f"draft slot position mismatch: expected {pos}, got {pos_actual}")
 
-        if self._can_cuda_graph(params, draft=True):
-            try:
-                st = self._get_draft_graph(seq_id, params)
-                st.input_ids[0, 0] = current_token
-                st.positions[0, 0] = pos
-                blk_idx = pos // self.block_size
-                blk_off = pos % self.block_size
-                phys = self.draft_mgr.block_tables[seq_id][blk_idx]
-                st.slot_mapping[0] = phys * self.block_size + blk_off
-                self.draft_mgr.fill_block_table_padded(
-                    seq_id, st.block_tables, self._max_blocks,
-                )
-                st.context_lens[0] = self.draft_mgr.context_lens[seq_id]
-                st.graph.replay()
-                draft_last = st.logits[:, -1, : self.shared_vocab_size]
-                token = sample(draft_last, params).item()
-                probs = logits_to_probs(draft_last, params.temperature)
-                return token, probs.squeeze(0)
-            except Exception as exc:
-                self._cuda_graph_draft_enabled = False
-                self._draft_graphs.clear()
-                print(f"[spec] draft decode cuda graph disabled: {exc}")
-
-        self.draft_mgr.compute_slot_mapping_into(seq_id, pos, 1, self._draft_slot_1)
-        self.draft_mgr.fill_block_table_padded(seq_id, self._draft_bt, self._max_blocks)
-        self._draft_cl[0] = self.draft_mgr.context_lens[seq_id]
-        self._draft_inp_1[0, 0] = current_token
-        self._draft_pos_1[0, 0] = pos
-        meta = InputMetadata(
-            slot_mapping=self._draft_slot_1,
-            block_tables=self._draft_bt,
-            context_lens=self._draft_cl,
-            block_size=self.block_size,
+        draft_logits = self._run_draft_forward(
+            seq_id=seq_id,
+            start_pos=pos,
+            tokens=[current_token],
+            params=params,
         )
-        draft_logits = self.draft(self._draft_inp_1, self._draft_pos_1, self._kv_list_draft, meta)
         draft_last = draft_logits[:, -1, : self.shared_vocab_size]
         probs = logits_to_probs(draft_last, params.temperature)
         token = sample(draft_last, params).item()
         return token, probs.squeeze(0)
 
-    def _resync_draft_batched(
-        self, seq_id: int, prefix_len: int, sync_tokens: List[int],
-    ) -> None:
-        n = len(sync_tokens)
+    def _run_draft_forward(
+        self,
+        seq_id: int,
+        start_pos: int,
+        tokens: List[int],
+        params: SamplingParams,
+    ) -> torch.Tensor:
+        """Run draft model forward for step/resync/final with shared buffers."""
+        n = len(tokens)
         if n <= 0:
-            return
-        self.draft_mgr.append_slots(seq_id, n)
-        self.draft_mgr.compute_slot_mapping_into(seq_id, prefix_len, n, self._resync_slots)
-        self.draft_mgr.fill_block_table_padded(seq_id, self._draft_bt, self._max_blocks)
-        self._draft_cl[0] = self.draft_mgr.context_lens[seq_id]
-        for i, tk in enumerate(sync_tokens):
-            self._resync_inp[0, i] = tk
+            raise RuntimeError("draft forward requires at least one token")
+
+        if self._can_cuda_graph(params, draft=True):
+            try:
+                st = self._get_draft_graph(n, params)
+                for i, t in enumerate(tokens):
+                    st.input_ids[0, i] = t
+                st.positions[0, :n].copy_(
+                    torch.arange(
+                        start_pos, start_pos + n,
+                        device=self.device, dtype=torch.long,
+                    ),
+                )
+                self.draft_mgr.compute_slot_mapping_into(
+                    seq_id, start_pos, n, st.slot_mapping,
+                )
+                self.draft_mgr.fill_block_table_padded(
+                    seq_id, st.block_tables, self._max_blocks,
+                )
+                st.context_lens[0] = self.draft_mgr.context_lens[seq_id]
+                st.graph.replay()
+                return st.logits
+            except Exception as exc:
+                self._cuda_graph_draft_enabled = False
+                self._draft_graphs.clear()
+                print(f"[spec] draft cuda graph disabled: {exc}")
+
+        for i, t in enumerate(tokens):
+            self._resync_inp[0, i] = t
         self._resync_pos[0, :n].copy_(
             torch.arange(
-                prefix_len, prefix_len + n,
+                start_pos, start_pos + n,
                 device=self.device, dtype=torch.long,
             ),
         )
+        self.draft_mgr.compute_slot_mapping_into(seq_id, start_pos, n, self._resync_slots)
+        self.draft_mgr.fill_block_table_padded(seq_id, self._draft_bt, self._max_blocks)
+        self._draft_cl[0] = self.draft_mgr.context_lens[seq_id]
         meta_d = InputMetadata(
             slot_mapping=self._resync_slots[:n],
             block_tables=self._draft_bt,
             context_lens=self._draft_cl,
             block_size=self.block_size,
         )
-        self.draft(
+        return self.draft(
             self._resync_inp[:, :n], self._resync_pos[:, :n],
             self._kv_list_draft, meta_d,
         )
 
-    def _draft_final_one(self, seq_id: int, final_pos: int, last_accepted: int) -> None:
-        self.draft_mgr.compute_slot_mapping_into(seq_id, final_pos, 1, self._draft_slot_1)
-        self.draft_mgr.fill_block_table_padded(seq_id, self._draft_bt, self._max_blocks)
-        self._draft_cl[0] = self.draft_mgr.context_lens[seq_id]
-        self._draft_inp_1[0, 0] = last_accepted
-        self._draft_pos_1[0, 0] = final_pos
-        meta_fd = InputMetadata(
-            slot_mapping=self._draft_slot_1,
-            block_tables=self._draft_bt,
-            context_lens=self._draft_cl,
-            block_size=self.block_size,
+    def _resync_draft_batched(
+        self,
+        seq_id: int,
+        prefix_len: int,
+        sync_tokens: List[int],
+        params: SamplingParams,
+    ) -> None:
+        n = len(sync_tokens)
+        if n <= 0:
+            return
+        self.draft_mgr.append_slots(seq_id, n)
+        self._run_draft_forward(
+            seq_id=seq_id,
+            start_pos=prefix_len,
+            tokens=sync_tokens,
+            params=params,
         )
-        self.draft(self._draft_inp_1, self._draft_pos_1, self._kv_list_draft, meta_fd)
+
+    def _draft_final_one(
+        self,
+        seq_id: int,
+        final_pos: int,
+        last_accepted: int,
+        params: SamplingParams,
+    ) -> None:
+        self._run_draft_forward(
+            seq_id=seq_id,
+            start_pos=final_pos,
+            tokens=[last_accepted],
+            params=params,
+        )
 
     # ------------------------------------------------------------------
     # Main speculative step
@@ -593,7 +614,12 @@ class SpeculativeDecoder:
                     "RESYNC_DRAFT", seq_id=seq_id, n=n_draft_accepted,
                     tokens=sync_tokens,
                 )
-                self._resync_draft_batched(seq_id, prefix_len, sync_tokens)
+                self._resync_draft_batched(
+                    seq_id=seq_id,
+                    prefix_len=prefix_len,
+                    sync_tokens=sync_tokens,
+                    params=params,
+                )
 
         # --- Final target + draft forward ---
         last_accepted = accepted[-1]
@@ -611,7 +637,12 @@ class SpeculativeDecoder:
 
         self.draft_mgr.append_slots(seq_id, 1)
         with record_function("final_draft"):
-            self._draft_final_one(seq_id, final_pos, last_accepted)
+            self._draft_final_one(
+                seq_id=seq_id,
+                final_pos=final_pos,
+                last_accepted=last_accepted,
+                params=params,
+            )
 
         new_saved = logits_to_probs(
             last_logits[:, -1, : self.shared_vocab_size], params.temperature,
