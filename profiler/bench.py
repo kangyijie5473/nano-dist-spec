@@ -32,6 +32,18 @@ def add_shared_cli_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--max-model-len", type=int, default=2048)
     parser.add_argument("--tensor-parallel-size", type=int, default=1)
     parser.add_argument("--num-gpu-blocks", type=int, default=None)
+    parser.add_argument(
+        "--prompt-mode",
+        choices=("random", "fixed"),
+        default="random",
+        help="random: vLLM-style synthetic prompts (--random-range-ratio 0); fixed: legacy repeating text",
+    )
+    parser.add_argument(
+        "--bench-seed",
+        type=int,
+        default=42,
+        help="RNG seed for random prompts (same seed → same prompt list across runs/spec K sweep)",
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -61,6 +73,8 @@ def to_shared_args(args: argparse.Namespace) -> SharedArgs:
         max_model_len=args.max_model_len,
         tensor_parallel_size=args.tensor_parallel_size,
         num_gpu_blocks=args.num_gpu_blocks,
+        prompt_mode=args.prompt_mode,
+        bench_seed=args.bench_seed,
     )
 
 

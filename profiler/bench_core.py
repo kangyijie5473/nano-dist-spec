@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import random
 import time
 from dataclasses import asdict, dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional, Sequence
 
 import torch
 from transformers import AutoTokenizer
@@ -29,7 +30,7 @@ def peak_mem_gb() -> float:
 
 
 def make_token_ids(tokenizer, length: int) -> List[int]:
-    """Create a deterministic token list with exact length."""
+    """Create a deterministic token list with exact length (fixed benchmark text)."""
     seed = (
         "Once upon a time, in a land far beyond the mountains, there lived a "
         "curious young scribe who spent every evening copying ancient texts "
@@ -46,6 +47,37 @@ def make_token_ids(tokenizer, length: int) -> List[int]:
     if bos is not None and length >= 1:
         ids[0] = bos
     return ids
+
+
+def make_random_token_ids(tokenizer, length: int, rng: random.Random) -> List[int]:
+    """Synthetic prompt aligned with vLLM `bench throughput --random-input-len L --random-range-ratio 0`.
+
+    Each token id is sampled uniformly from the tokenizer vocabulary, excluding
+    BOS/EOS/PAD if present so prompts rarely terminate during prefill.
+    """
+    vocab = int(getattr(tokenizer, "vocab_size", 0) or 0)
+    if vocab <= 0:
+        raise ValueError("tokenizer.vocab_size missing for random prompts")
+
+    bad_ids = {
+        x
+        for x in (
+            getattr(tokenizer, "eos_token_id", None),
+            getattr(tokenizer, "pad_token_id", None),
+            getattr(tokenizer, "bos_token_id", None),
+        )
+        if x is not None
+    }
+
+    out: List[int] = []
+    for _ in range(length):
+        tid = rng.randrange(vocab)
+        guard = 0
+        while tid in bad_ids and guard < 32:
+            tid = rng.randrange(vocab)
+            guard += 1
+        out.append(tid)
+    return out
 
 
 def reset_scheduler(engine: LLMEngine) -> None:
@@ -81,6 +113,9 @@ class SharedArgs:
     max_model_len: int
     tensor_parallel_size: int
     num_gpu_blocks: Optional[int] = None
+    #: `random`: i.i.d. token ids per prompt (vLLM-style synthetic); `fixed`: legacy seed text.
+    prompt_mode: Literal["fixed", "random"] = "random"
+    bench_seed: int = 42
 
     def validate(self, max_k: int = 0) -> None:
         if self.max_num_seqs != 1:
@@ -90,6 +125,22 @@ class SharedArgs:
             raise ValueError(
                 f"max_model_len 太小: 需要 >= {required}, 当前 {self.max_model_len}",
             )
+
+
+def _make_prompt_list(
+    tokenizer,
+    shared: SharedArgs,
+    rng: random.Random,
+) -> List[List[int]]:
+    """Build one prompt per request: identical repeats for `fixed`, i.i.d. for `random`."""
+    if shared.prompt_mode == "fixed":
+        base = make_token_ids(tokenizer, shared.input_len)
+        return [list(base) for _ in range(shared.num_prompts)]
+
+    return [
+        make_random_token_ids(tokenizer, shared.input_len, rng)
+        for _ in range(shared.num_prompts)
+    ]
 
 
 def _build_target_engine(
@@ -152,9 +203,8 @@ def _bench_basic_single(
 
 def _bench_basic_prompt_set(
     engine: LLMEngine,
-    prompt_ids: List[int],
+    prompts: Sequence[Sequence[int]],
     output_len: int,
-    num_prompts: int,
 ) -> Dict[str, Any]:
     reset_cuda_mem_stats()
     reset_scheduler(engine)
@@ -164,13 +214,14 @@ def _bench_basic_prompt_set(
 
     cuda_sync()
     t0 = time.perf_counter()
-    for _ in range(num_prompts):
-        r = _bench_basic_single(engine, prompt_ids, output_len)
+    for prompt_ids in prompts:
+        r = _bench_basic_single(engine, list(prompt_ids), output_len)
         per_request.append(r)
         total_output_tokens += int(r["total_tokens"])
     cuda_sync()
     elapsed = time.perf_counter() - t0
 
+    num_prompts = len(prompts)
     n = max(len(per_request), 1)
     return {
         "throughput": throughput_metrics(elapsed, num_prompts, total_output_tokens),
@@ -183,14 +234,14 @@ def _bench_basic_prompt_set(
 def run_basic(model: str, shared: SharedArgs) -> Dict[str, Any]:
     shared.validate(max_k=0)
     tokenizer = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
-    prompt_ids = make_token_ids(tokenizer, shared.input_len)
+    rng = random.Random(shared.bench_seed)
+    prompts = _make_prompt_list(tokenizer, shared, rng)
 
     engine = _build_target_engine(model, shared)
     result = _bench_basic_prompt_set(
         engine=engine,
-        prompt_ids=prompt_ids,
+        prompts=prompts,
         output_len=shared.output_len,
-        num_prompts=shared.num_prompts,
     )
     return {
         "mode": "basic",
@@ -229,6 +280,11 @@ def _bench_spec_single(
     total_draft_accepted = 0
     num_rounds = 0
     accept_by_pos = [0] * spec.K
+    #: drafted_by_pos[i] = number of rounds where the draft loop reached position i
+    #: (i.e. steps 0..i-1 were all accepted in that round, so step i was actually evaluated).
+    #: This is the denominator for the per-position *conditional* acceptance rate,
+    #: matching vLLM's "Per-position acceptance rate".
+    drafted_by_pos = [0] * spec.K
 
     cuda_sync()
     t1 = time.perf_counter()
@@ -246,6 +302,9 @@ def _bench_spec_single(
         total_draft_accepted += n_draft_accepted
         for pos in range(min(n_draft_accepted, spec.K)):
             accept_by_pos[pos] += 1
+        for pos in range(n_draft_accepted + 1):
+            if pos < spec.K:
+                drafted_by_pos[pos] += 1
         num_rounds += 1
     cuda_sync()
     decode_s = time.perf_counter() - t1
@@ -256,6 +315,24 @@ def _bench_spec_single(
     llm.engine.kv_mgr.free_seq(seq_id)
     spec.draft_mgr.free_seq(seq_id)
 
+    # Per-position conditional acceptance rate: accept_by_pos[i] / drafted_by_pos[i]
+    # This matches vLLM's "Per-position acceptance rate":
+    #   P(accept at pos i | draft loop actually reached pos i)
+    per_pos_accept_rate: List[Optional[float]] = []
+    for pos in range(spec.K):
+        denom = drafted_by_pos[pos]
+        if denom > 0:
+            per_pos_accept_rate.append(accept_by_pos[pos] / denom)
+        else:
+            per_pos_accept_rate.append(None)
+
+    # Mean acceptance length (vLLM: "Mean acceptance length")
+    mean_acceptance_length = total_draft_accepted / num_rounds if num_rounds else 0.0
+
+    # Accepted / Drafted throughput (vLLM semantics over decode phase)
+    accepted_throughput = total_draft_accepted / decode_s if decode_s > 0 else 0.0
+    drafted_throughput = total_draft / decode_s if decode_s > 0 else 0.0
+
     return {
         "ttft_s": ttft_s,
         "decode_tps": (decode_tokens / decode_s) if decode_s > 0 else 0.0,
@@ -264,22 +341,26 @@ def _bench_spec_single(
         "total_draft": total_draft,
         "total_draft_accepted": total_draft_accepted,
         "draft_accept_counts_by_pos": accept_by_pos,
+        "drafted_counts_by_pos": drafted_by_pos,
         "draft_accept_rate_by_pos": [
             (cnt / num_rounds) if num_rounds else 0.0 for cnt in accept_by_pos
         ],
+        "per_pos_accept_rate": per_pos_accept_rate,
         "num_rounds": num_rounds,
         "tokens_per_round": (total_accepted / num_rounds) if num_rounds else 0.0,
         "draft_accept_rate": (
             total_draft_accepted / total_draft if total_draft else 0.0
         ),
+        "mean_acceptance_length": mean_acceptance_length,
+        "accepted_throughput": accepted_throughput,
+        "drafted_throughput": drafted_throughput,
     }
 
 
 def _bench_spec_prompt_set(
     llm: LLM,
-    prompt_ids: List[int],
+    prompts: Sequence[Sequence[int]],
     output_len: int,
-    num_prompts: int,
 ) -> Dict[str, Any]:
     reset_cuda_mem_stats()
     spec = llm._spec_decoder
@@ -293,11 +374,14 @@ def _bench_spec_prompt_set(
     total_draft_accepted = 0
     total_rounds = 0
     accept_by_pos = [0] * spec.K
+    drafted_by_pos = [0] * spec.K
+
+    num_prompts = len(prompts)
 
     cuda_sync()
     t0 = time.perf_counter()
-    for _ in range(num_prompts):
-        r = _bench_spec_single(llm, prompt_ids, output_len)
+    for prompt_ids in prompts:
+        r = _bench_spec_single(llm, list(prompt_ids), output_len)
         per_request.append(r)
         total_output_tokens += int(r["total_tokens"])
         total_accepted += int(r["total_accepted"])
@@ -306,10 +390,31 @@ def _bench_spec_prompt_set(
         total_rounds += int(r["num_rounds"])
         for i, cnt in enumerate(r["draft_accept_counts_by_pos"]):
             accept_by_pos[i] += int(cnt)
+        for i, cnt in enumerate(r.get("drafted_counts_by_pos", [])):
+            if i < spec.K:
+                drafted_by_pos[i] += int(cnt)
     cuda_sync()
     elapsed = time.perf_counter() - t0
 
     n = max(len(per_request), 1)
+
+    # Per-position conditional acceptance rate (vLLM: "Per-position acceptance rate")
+    per_pos_accept_rate: List[Optional[float]] = []
+    for pos in range(spec.K):
+        denom = drafted_by_pos[pos]
+        if denom > 0:
+            per_pos_accept_rate.append(accept_by_pos[pos] / denom)
+        else:
+            per_pos_accept_rate.append(None)
+
+    # Mean acceptance length (vLLM: "Mean acceptance length")
+    mean_acceptance_length = total_draft_accepted / total_rounds if total_rounds else 0.0
+
+    # Accepted / Drafted throughput (vLLM semantics, computed over wall-clock decode phase)
+    total_decode_s = elapsed  # elapsed covers the full decode loop including prefill per-request
+    accepted_throughput = total_draft_accepted / total_decode_s if total_decode_s > 0 else 0.0
+    drafted_throughput = total_draft / total_decode_s if total_decode_s > 0 else 0.0
+
     return {
         "K": spec.K,
         "throughput": throughput_metrics(elapsed, num_prompts, total_output_tokens),
@@ -319,14 +424,19 @@ def _bench_spec_prompt_set(
         "total_draft": total_draft,
         "total_draft_accepted": total_draft_accepted,
         "draft_accept_counts_by_pos": accept_by_pos,
+        "drafted_counts_by_pos": drafted_by_pos,
         "draft_accept_rate_by_pos": [
             (cnt / total_rounds) if total_rounds else 0.0 for cnt in accept_by_pos
         ],
+        "per_pos_accept_rate": per_pos_accept_rate,
         "num_rounds": total_rounds,
         "tokens_per_round": (total_accepted / total_rounds) if total_rounds else 0.0,
         "draft_accept_rate": (
             total_draft_accepted / total_draft if total_draft else 0.0
         ),
+        "mean_acceptance_length": mean_acceptance_length,
+        "accepted_throughput": accepted_throughput,
+        "drafted_throughput": drafted_throughput,
         "peak_mem_gb": peak_mem_gb(),
     }
 
@@ -349,7 +459,8 @@ def run_spec(
     max_k = max(k_values)
     shared.validate(max_k=max_k)
     tokenizer = AutoTokenizer.from_pretrained(target_model, trust_remote_code=True)
-    prompt_ids = make_token_ids(tokenizer, shared.input_len)
+    rng = random.Random(shared.bench_seed)
+    prompts = _make_prompt_list(tokenizer, shared, rng)
 
     llm = LLM(
         model_path=target_model,
@@ -367,9 +478,8 @@ def run_spec(
         llm._spec_decoder.K = k
         result = _bench_spec_prompt_set(
             llm=llm,
-            prompt_ids=prompt_ids,
+            prompts=prompts,
             output_len=shared.output_len,
-            num_prompts=shared.num_prompts,
         )
         sweep.append(result)
 
