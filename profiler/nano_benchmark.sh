@@ -116,6 +116,16 @@ tps = tp.get("output_token_throughput_tps", 0.0)
 elapsed = tp.get("elapsed_s", 0.0)
 accept = row.get("draft_accept_rate", 0.0)
 tokens_per_round = row.get("tokens_per_round", 0.0)
+num_rounds = int(row.get("num_rounds", 0))
+mean_accept_len = row.get("mean_acceptance_length", 0.0)
+accepted_tps = row.get("accepted_throughput", 0.0)
+drafted_tps = row.get("drafted_throughput", 0.0)
+total_accepted = int(row.get("total_draft_accepted", 0))
+total_drafted = int(row.get("total_draft", 0))
+per_pos = row.get("per_pos_accept_rate", [])
+per_pos_str = ", ".join(
+    f"{v:.3f}" if v is not None else "n/a" for v in per_pos
+)
 
 print(
     "Throughput: "
@@ -126,7 +136,19 @@ print(
 print(
     "SpecDecoding: "
     f"accept_rate={accept:.4%}, "
-    f"tokens_per_round={tokens_per_round:.4f}"
+    f"tokens_per_round={tokens_per_round:.4f}, "
+    f"num_rounds={num_rounds}"
+)
+print(
+    "SpecDecoding metrics: "
+    f"Mean acceptance length: {mean_accept_len:.2f}, "
+    f"Accepted throughput: {accepted_tps:.2f} tokens/s, "
+    f"Drafted throughput: {drafted_tps:.2f} tokens/s, "
+    f"Accepted: {total_accepted} tokens, "
+    f"Drafted: {total_drafted} tokens"
+)
+print(
+    "Per-position acceptance rate: " + per_pos_str
 )
 PY
 }
@@ -148,16 +170,16 @@ log_summary ""
 log_summary ">>> [1/$((${#K_VALUES[@]} + 1))] Running BASELINE (no spec decode)..."
 log_summary "Start time: $(date +"%Y-%m-%d %H:%M:%S")"
 
-python "${BENCH_PY}" --out-dir "${OUT_DIR}" basic \
-    --model "${TARGET_MODEL}" \
-    --input-len "${INPUT_LEN}" \
-    --output-len "${OUTPUT_LEN}" \
-    --num-prompts "${NUM_PROMPTS}" \
-    --max-num-seqs "${MAX_NUM_SEQS}" \
-    --max-model-len "${MAX_MODEL_LEN}" \
-    --tensor-parallel-size "${TP_SIZE}" \
-    --num-gpu-blocks "${NUM_GPU_BLOCKS}" \
-    > "${BASELINE_LOG}" 2>&1
+# python "${BENCH_PY}" --out-dir "${OUT_DIR}" basic \
+#     --model "${TARGET_MODEL}" \
+#     --input-len "${INPUT_LEN}" \
+#     --output-len "${OUTPUT_LEN}" \
+#     --num-prompts "${NUM_PROMPTS}" \
+#     --max-num-seqs "${MAX_NUM_SEQS}" \
+#     --max-model-len "${MAX_MODEL_LEN}" \
+#     --tensor-parallel-size "${TP_SIZE}" \
+#     --num-gpu-blocks "${NUM_GPU_BLOCKS}" \
+#     > "${BASELINE_LOG}" 2>&1
 
 BASELINE_EXIT=$?
 BASELINE_JSON=$(latest_json_file "basic")

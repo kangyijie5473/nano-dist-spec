@@ -270,7 +270,7 @@ def _bench_spec_single(
 
     cuda_sync()
     t0 = time.perf_counter()
-    first_token, saved_probs = spec.prefill(seq_id, prompt_tensor, params)
+    first_token = spec.prefill(seq_id, prompt_tensor, params)
     cuda_sync()
     ttft_s = time.perf_counter() - t0
 
@@ -289,9 +289,7 @@ def _bench_spec_single(
     cuda_sync()
     t1 = time.perf_counter()
     while len(generated) < output_len:
-        out, saved_probs = spec.speculative_step(
-            seq_id, generated[-1], saved_probs, params,
-        )
+        out = spec.speculative_step(seq_id, generated[-1], params)
         generated.extend(out.accepted_tokens)
         total_accepted += out.num_accepted
         total_draft += out.num_draft_tokens
