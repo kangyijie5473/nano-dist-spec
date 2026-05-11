@@ -425,7 +425,7 @@ class LLM:
             self._spec_decoder.draft_mgr.allocate_seq(seq_id, len(prompt_ids))
 
             prompt_tensor = torch.tensor([prompt_ids], device=self.engine.device)
-            first_token = self._spec_decoder.prefill(
+            first_token, saved_probs = self._spec_decoder.prefill(
                 seq_id, prompt_tensor, params,
             )
 
@@ -437,9 +437,11 @@ class LLM:
                 if generated[-1] == eos_id:
                     break
 
-                output = self._spec_decoder.speculative_step(
-                    seq_id, generated[-1], params,
+                output, saved_probs = self._spec_decoder.speculative_step(
+                    seq_id, generated[-1], saved_probs, params,
                 )
+                ground_truth[seq_id].extend(output.accepted_tokens)#debug
+                self._spec_decoder.verify_draft_kv_against_groundtruth(seq_id, ground_truth[seq_id], layer=0)#debug
                 generated.extend(output.accepted_tokens)
                 total_accepted += output.num_accepted
                 total_draft += output.num_draft_tokens
