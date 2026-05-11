@@ -122,7 +122,7 @@ accepted_tps = row.get("accepted_throughput", 0.0)
 drafted_tps = row.get("drafted_throughput", 0.0)
 total_accepted = int(row.get("total_draft_accepted", 0))
 total_drafted = int(row.get("total_draft", 0))
-per_pos = row.get("per_pos_accept_rate", [])
+per_pos = row.get("draft_accept_rate_by_pos", [])
 per_pos_str = ", ".join(
     f"{v:.3f}" if v is not None else "n/a" for v in per_pos
 )
@@ -149,6 +149,7 @@ print(
 )
 print(
     "Per-position acceptance rate: " + per_pos_str
+    + "   # accept[i] / num_rounds, aligned with vLLM logs (monotonically non-increasing)"
 )
 PY
 }
@@ -170,16 +171,16 @@ log_summary ""
 log_summary ">>> [1/$((${#K_VALUES[@]} + 1))] Running BASELINE (no spec decode)..."
 log_summary "Start time: $(date +"%Y-%m-%d %H:%M:%S")"
 
-# python "${BENCH_PY}" --out-dir "${OUT_DIR}" basic \
-#     --model "${TARGET_MODEL}" \
-#     --input-len "${INPUT_LEN}" \
-#     --output-len "${OUTPUT_LEN}" \
-#     --num-prompts "${NUM_PROMPTS}" \
-#     --max-num-seqs "${MAX_NUM_SEQS}" \
-#     --max-model-len "${MAX_MODEL_LEN}" \
-#     --tensor-parallel-size "${TP_SIZE}" \
-#     --num-gpu-blocks "${NUM_GPU_BLOCKS}" \
-#     > "${BASELINE_LOG}" 2>&1
+python "${BENCH_PY}" --out-dir "${OUT_DIR}" basic \
+    --model "${TARGET_MODEL}" \
+    --input-len "${INPUT_LEN}" \
+    --output-len "${OUTPUT_LEN}" \
+    --num-prompts "${NUM_PROMPTS}" \
+    --max-num-seqs "${MAX_NUM_SEQS}" \
+    --max-model-len "${MAX_MODEL_LEN}" \
+    --tensor-parallel-size "${TP_SIZE}" \
+    --num-gpu-blocks "${NUM_GPU_BLOCKS}" \
+    > "${BASELINE_LOG}" 2>&1
 
 BASELINE_EXIT=$?
 BASELINE_JSON=$(latest_json_file "basic")

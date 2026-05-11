@@ -280,10 +280,6 @@ def _bench_spec_single(
     total_draft_accepted = 0
     num_rounds = 0
     accept_by_pos = [0] * spec.K
-    #: drafted_by_pos[i] = number of rounds where the draft loop reached position i
-    #: (i.e. steps 0..i-1 were all accepted in that round, so step i was actually evaluated).
-    #: This is the denominator for the per-position *conditional* acceptance rate,
-    #: matching vLLM's "Per-position acceptance rate".
     drafted_by_pos = [0] * spec.K
 
     cuda_sync()
@@ -313,16 +309,17 @@ def _bench_spec_single(
     llm.engine.kv_mgr.free_seq(seq_id)
     spec.draft_mgr.free_seq(seq_id)
 
-    # Per-position conditional acceptance rate: accept_by_pos[i] / drafted_by_pos[i]
-    # This matches vLLM's "Per-position acceptance rate":
-    #   P(accept at pos i | draft loop actually reached pos i)
-    per_pos_accept_rate: List[Optional[float]] = []
+    # Per-position **conditional** acceptance rate:
+    #   denom = drafted_by_pos[pos] (# rounds that REACHED position pos, i.e.
+    #   pos 0..pos-1 all accepted). Subject to survivorship bias, can rise with pos.
+    #   Useful as a diagnostic; *not* the metric vLLM logs.
+    per_pos_accept_rate_conditional: List[Optional[float]] = []
     for pos in range(spec.K):
         denom = drafted_by_pos[pos]
         if denom > 0:
-            per_pos_accept_rate.append(accept_by_pos[pos] / denom)
+            per_pos_accept_rate_conditional.append(accept_by_pos[pos] / denom)
         else:
-            per_pos_accept_rate.append(None)
+            per_pos_accept_rate_conditional.append(None)
 
     # Mean acceptance length (vLLM: "Mean acceptance length")
     mean_acceptance_length = total_draft_accepted / num_rounds if num_rounds else 0.0
@@ -340,10 +337,14 @@ def _bench_spec_single(
         "total_draft_accepted": total_draft_accepted,
         "draft_accept_counts_by_pos": accept_by_pos,
         "drafted_counts_by_pos": drafted_by_pos,
+        # vLLM-aligned "Per-position acceptance rate": accept[i] / num_rounds.
+        # Denominator is total rounds (not "rounds reaching pos i"), so the curve
+        # is monotonically non-increasing by construction. This is the口径 vLLM
+        # prints in its runtime metrics and the default to display in benchmarks.
         "draft_accept_rate_by_pos": [
             (cnt / num_rounds) if num_rounds else 0.0 for cnt in accept_by_pos
         ],
-        "per_pos_accept_rate": per_pos_accept_rate,
+        "per_pos_accept_rate_conditional": per_pos_accept_rate_conditional,
         "num_rounds": num_rounds,
         "tokens_per_round": (total_accepted / num_rounds) if num_rounds else 0.0,
         "draft_accept_rate": (
@@ -353,6 +354,7 @@ def _bench_spec_single(
         "accepted_throughput": accepted_throughput,
         "drafted_throughput": drafted_throughput,
     }
+
 
 
 def _bench_spec_prompt_set(
@@ -396,14 +398,17 @@ def _bench_spec_prompt_set(
 
     n = max(len(per_request), 1)
 
-    # Per-position conditional acceptance rate (vLLM: "Per-position acceptance rate")
-    per_pos_accept_rate: List[Optional[float]] = []
+    # Per-position **conditional** acceptance rate (nano-internal diagnostic).
+    # Denominator is "# rounds that reached position pos". Subject to survivorship
+    # bias — can rise with pos. NOT the metric vLLM logs; see
+    # `draft_accept_rate_by_pos` below for the vLLM-aligned口径.
+    per_pos_accept_rate_conditional: List[Optional[float]] = []
     for pos in range(spec.K):
         denom = drafted_by_pos[pos]
         if denom > 0:
-            per_pos_accept_rate.append(accept_by_pos[pos] / denom)
+            per_pos_accept_rate_conditional.append(accept_by_pos[pos] / denom)
         else:
-            per_pos_accept_rate.append(None)
+            per_pos_accept_rate_conditional.append(None)
 
     # Mean acceptance length (vLLM: "Mean acceptance length")
     mean_acceptance_length = total_draft_accepted / total_rounds if total_rounds else 0.0
@@ -423,10 +428,11 @@ def _bench_spec_prompt_set(
         "total_draft_accepted": total_draft_accepted,
         "draft_accept_counts_by_pos": accept_by_pos,
         "drafted_counts_by_pos": drafted_by_pos,
+        # vLLM-aligned "Per-position acceptance rate" — see _bench_spec_single().
         "draft_accept_rate_by_pos": [
             (cnt / total_rounds) if total_rounds else 0.0 for cnt in accept_by_pos
         ],
-        "per_pos_accept_rate": per_pos_accept_rate,
+        "per_pos_accept_rate_conditional": per_pos_accept_rate_conditional,
         "num_rounds": total_rounds,
         "tokens_per_round": (total_accepted / total_rounds) if total_rounds else 0.0,
         "draft_accept_rate": (
