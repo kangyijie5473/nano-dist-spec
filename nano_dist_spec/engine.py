@@ -440,8 +440,6 @@ class LLM:
                 output, saved_probs = self._spec_decoder.speculative_step(
                     seq_id, generated[-1], saved_probs, params,
                 )
-                ground_truth[seq_id].extend(output.accepted_tokens)#debug
-                self._spec_decoder.verify_draft_kv_against_groundtruth(seq_id, ground_truth[seq_id], layer=0)#debug
                 generated.extend(output.accepted_tokens)
                 total_accepted += output.num_accepted
                 total_draft += output.num_draft_tokens
