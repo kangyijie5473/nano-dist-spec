@@ -111,7 +111,7 @@ class SpeculativeDecoder:
         draft_kv_mgr: KVCacheManager,
         num_speculative_tokens: int = 5,
         block_size: int = 16,
-        use_cuda_graph: bool = True,
+        use_cuda_graph: bool = False,
         max_seq_len: int = 4096,
     ):
         self.target = target_model
@@ -137,15 +137,17 @@ class SpeculativeDecoder:
         mb = self._max_blocks
         cap = self._max_k_cap
 
-        # Target eager buffers — shared by verify (k tokens) and final (1 token)
-        # since they execute sequentially.
-        self._target_inp = torch.zeros((1, cap), dtype=torch.long, device=self.device)
-        self._target_pos = torch.zeros((1, cap), dtype=torch.long, device=self.device)
-        self._target_slots = torch.zeros((cap,), dtype=torch.long, device=self.device)
+        # Target eager buffers — verify processes K+1 tokens ([last_token] + draft),
+        # so we need cap+1 slots. There is no longer a separate final target forward.
+        self._target_inp = torch.zeros((1, cap + 1), dtype=torch.long, device=self.device)
+        self._target_pos = torch.zeros((1, cap + 1), dtype=torch.long, device=self.device)
+        self._target_slots = torch.zeros((cap + 1,), dtype=torch.long, device=self.device)
         self._target_bt = torch.zeros((1, mb), dtype=torch.long, device=self.device)
         self._target_cl = torch.zeros((1,), dtype=torch.long, device=self.device)
 
-        # Draft eager buffers — shared by step_one, resync, and final.
+        # Draft eager buffers — only single-token forwards now (loop iter + post-verify
+        # write of d_{K-1} when all accepted). `_resync_*` retained at cap to support
+        # legacy 1-token forwards through the same code path.
         self._draft_inp_1 = torch.zeros((1, 1), dtype=torch.long, device=self.device)
         self._draft_pos_1 = torch.zeros((1, 1), dtype=torch.long, device=self.device)
         self._draft_slot_1 = torch.zeros((1,), dtype=torch.long, device=self.device)
@@ -333,8 +335,15 @@ class SpeculativeDecoder:
     @torch.inference_mode()
     def prefill(
         self, seq_id: int, prompt_ids: torch.Tensor, params: SamplingParams,
-    ) -> Tuple[int, torch.Tensor]:
-        """Prefill both models, return first token and saved target logits."""
+    ) -> int:
+        """Prefill both models and return the first generated token.
+
+        The first token is sampled from the target's last-position logits but
+        is NOT yet written to either KV cache. It is treated as a "pending"
+        token: the first call to :meth:`speculative_step` will receive it as
+        ``last_token`` and write it into both caches as the first input of
+        target's verify forward (and as the seed of the draft loop).
+        """
         bsz, seq_len = prompt_ids.shape
         positions = torch.arange(seq_len, device=self.device).unsqueeze(0)
         tracer.on_spec_event("PREFILL", seq_id=seq_id, prompt_len=seq_len)
@@ -351,8 +360,7 @@ class SpeculativeDecoder:
 
         target_last = target_logits[:, -1, : self.shared_vocab_size]
         first_token = sample(target_last, params).item()
-        saved_probs = logits_to_probs(target_last, params.temperature)
-        return first_token, saved_probs
+        return first_token
 
     # ------------------------------------------------------------------
     # Draft helpers
@@ -436,38 +444,6 @@ class SpeculativeDecoder:
             self._kv_list_draft, meta_d,
         )
 
-    def _resync_draft_batched(
-        self,
-        seq_id: int,
-        prefix_len: int,
-        sync_tokens: List[int],
-        params: SamplingParams,
-    ) -> None:
-        n = len(sync_tokens)
-        if n <= 0:
-            return
-        self.draft_mgr.append_slots(seq_id, n)
-        self._run_draft_forward(
-            seq_id=seq_id,
-            start_pos=prefix_len,
-            tokens=sync_tokens,
-            params=params,
-        )
-
-    def _draft_final_one(
-        self,
-        seq_id: int,
-        final_pos: int,
-        last_accepted: int,
-        params: SamplingParams,
-    ) -> None:
-        self._run_draft_forward(
-            seq_id=seq_id,
-            start_pos=final_pos,
-            tokens=[last_accepted],
-            params=params,
-        )
-
     # ------------------------------------------------------------------
     # Main speculative step
     # ------------------------------------------------------------------
@@ -477,14 +453,21 @@ class SpeculativeDecoder:
         self,
         seq_id: int,
         last_token: int,
-        saved_target_probs: torch.Tensor,
         params: SamplingParams,
-    ) -> Tuple[SpeculativeOutput, torch.Tensor]:
+    ) -> SpeculativeOutput:
         """Execute one draft-then-verify round.
 
-        Returns:
-            output: SpeculativeOutput with accepted tokens
-            new_saved_probs: target probs for verifying the next round's first draft
+        ``last_token`` is the token PENDING write to KV cache — either the
+        ``first_token`` returned by :meth:`prefill`, or the bonus/correction
+        accepted at the end of the previous step. It will be written to both
+        target (via verify) and draft (via draft-loop iter 0) caches at
+        position ``prefix_len`` during this step.
+
+        The target verify forward processes ``[last_token, d_0, ..., d_{K-1}]``
+        at positions ``[P, P+1, ..., P+K]``. ``target_logits[i]`` for
+        ``i in [0, K-1]`` verifies ``d_i``; ``target_logits[K]`` is the bonus
+        prediction. This is the standard "one-shot" verification convention
+        used by vLLM and the Leviathan et al. paper.
         """
         K = self.K
         prefix_len = self.target_mgr.context_lens[seq_id]
@@ -497,6 +480,11 @@ class SpeculativeDecoder:
         )
 
         # --- Draft ---
+        # Iter 0 processes ``last_token`` at pos ``prefix_len`` and predicts ``d_0``;
+        # iter i (i>0) processes ``d_{i-1}`` at pos ``prefix_len+i`` and predicts ``d_i``.
+        # After the loop, draft cache contains [..., last_token, d_0..d_{K-2}] at
+        # positions [..., P, P+1, ..., P+K-1]. ``d_{K-1}`` is sampled but NOT yet
+        # in draft cache.
         draft_tokens: List[int] = []
         draft_probs_list: List[torch.Tensor] = []
 
@@ -512,20 +500,27 @@ class SpeculativeDecoder:
         tracer.on_spec_event("DRAFT_DONE", tokens=draft_tokens)
 
         # --- Verify ---
+        # Target processes K+1 tokens (last_token plus K draft tokens) at positions
+        # [prefix_len, prefix_len+K]. This writes last_token at pos prefix_len —
+        # the key fix: previously last_token's KV was missing, causing the cache
+        # to drift one position relative to the actual generated sequence.
         tracer.on_spec_event(
             "VERIFY", seq_id=seq_id,
-            range=f"[{prefix_len},{prefix_len + K})", num_tokens=K,
+            range=f"[{prefix_len},{prefix_len + K}]", num_tokens=K + 1,
         )
-        for _ in range(K):
+        for _ in range(K + 1):
             self.target_mgr.append_slots(seq_id, 1)
 
         with record_function("verify_target_batch"):
             target_logits = self._run_target_forward(
-                seq_id, prefix_len, draft_tokens, params,
+                seq_id, prefix_len, [last_token] + draft_tokens, params,
             )
 
-        target_probs_verify: List[torch.Tensor] = [saved_target_probs.squeeze(0)]
-        for i in range(K):
+        # target_logits[i] = pred at pos prefix_len+i+1 given [last_token, d_0..d_{i-1}].
+        #   - i in [0, K-1]: verifies draft_tokens[i]
+        #   - i == K       : bonus distribution
+        target_probs_verify: List[torch.Tensor] = []
+        for i in range(K + 1):
             target_probs_verify.append(
                 logits_to_probs(
                     target_logits[:, i, : self.shared_vocab_size],
@@ -539,13 +534,9 @@ class SpeculativeDecoder:
 
         with record_function("rejection_sampling"):
             if params.temperature == 0 and K > 0:
-                saved_flat = saved_target_probs.reshape(-1)
-                ch0 = saved_flat.argmax()
-                if K > 1:
-                    ch_rest = target_logits[0, : K - 1, : self.shared_vocab_size].argmax(dim=-1)
-                    choices = torch.cat([ch0.reshape(1), ch_rest], dim=0)
-                else:
-                    choices = ch0.reshape(1)
+                # Greedy: choices[i] = target's greedy prediction at pos P+i+1
+                # given last_token + d_0..d_{i-1}. Accept iff equal to d_i.
+                choices = target_logits[0, :K, : self.shared_vocab_size].argmax(dim=-1)
                 draft_t = torch.tensor(draft_tokens, device=self.device, dtype=torch.long)
                 eq = choices == draft_t
                 if bool(eq.all().item()):
@@ -596,61 +587,43 @@ class SpeculativeDecoder:
         n_accepted = len(accepted)
         n_draft_accepted = K if all_accepted else (n_accepted - 1)
 
-        # --- Rollback + Resync ---
+        # --- Cache management ---
+        # Target cache after verify holds [..., last_token, d_0..d_{K-1}] at
+        # [..., P..P+K] (context_lens = P+K+1). The new pending token
+        # (bonus or correction) is NOT written — it'll be written in the next
+        # step's verify as the new last_token.
+        #   - all accepted (n_draft_accepted == K): no rollback needed.
+        #   - partial (j < K): rollback to P+j+1, keeping last_token + d_0..d_{j-1}.
+        target_keep = prefix_len + n_draft_accepted + 1
         with record_function("rollback_kv"):
             tracer.on_spec_event(
                 "ROLLBACK", seq_id=seq_id,
-                target_to=prefix_len + n_draft_accepted,
-                draft_to=prefix_len,
+                target_to=target_keep,
+                draft_to=target_keep,
                 n_draft_accepted=n_draft_accepted,
             )
-            self.target_mgr.rollback(seq_id, prefix_len + n_draft_accepted)
-            self.draft_mgr.rollback(seq_id, prefix_len)
+            self.target_mgr.rollback(seq_id, target_keep)
 
-        with record_function("resync_draft"):
-            if n_draft_accepted > 0:
-                sync_tokens = accepted[:n_draft_accepted]
-                tracer.on_spec_event(
-                    "RESYNC_DRAFT", seq_id=seq_id, n=n_draft_accepted,
-                    tokens=sync_tokens,
-                )
-                self._resync_draft_batched(
+        # Draft cache after draft loop has [..., last_token, d_0..d_{K-2}] at
+        # [..., P..P+K-1] (context_lens = P+K). To match target:
+        #   - all accepted: append d_{K-1} at pos P+K (one extra 1-token forward).
+        #   - partial (j < K): rollback to P+j+1, keeping last_token + d_0..d_{j-1}.
+        if all_accepted and K > 0:
+            self.draft_mgr.append_slots(seq_id, 1)
+            with record_function("draft_write_last"):
+                self._run_draft_forward(
                     seq_id=seq_id,
-                    prefix_len=prefix_len,
-                    sync_tokens=sync_tokens,
+                    start_pos=prefix_len + K,
+                    tokens=[draft_tokens[K - 1]],
                     params=params,
                 )
-
-        # --- Final target + draft forward ---
-        last_accepted = accepted[-1]
-        final_pos = prefix_len + n_draft_accepted
-        tracer.on_spec_event(
-            "FINAL", seq_id=seq_id, token=last_accepted, pos=final_pos,
-            accepted=accepted,
-        )
-
-        self.target_mgr.append_slots(seq_id, 1)
-        with record_function("final_target"):
-            last_logits = self._run_target_forward(
-                seq_id, final_pos, [last_accepted], params,
-            )
-
-        self.draft_mgr.append_slots(seq_id, 1)
-        with record_function("final_draft"):
-            self._draft_final_one(
-                seq_id=seq_id,
-                final_pos=final_pos,
-                last_accepted=last_accepted,
-                params=params,
-            )
-
-        new_saved = logits_to_probs(
-            last_logits[:, -1, : self.shared_vocab_size], params.temperature,
-        )
+        else:
+            self.draft_mgr.rollback(seq_id, target_keep)
 
         output = SpeculativeOutput(
             accepted_tokens=accepted,
             num_draft_tokens=K,
             num_accepted=n_accepted,
         )
-        return output, new_saved
+        return output
+

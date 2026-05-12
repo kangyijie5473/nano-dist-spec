@@ -740,3 +740,336 @@ python profiler/vllm_basic_match_bench.py \
    - `OSL=256`: `80.65 output tok/s`（约 `1.70x`）
    - `OSL=512`: `86.80 output tok/s`（约 `1.82x`）
 3. baseline 的 output 吞吐在两组长度下接近（47.47 vs 47.72 tok/s），说明在当前配置下 target-only decode 稳态速度较稳定；spec 的收益主要体现在每轮接受更多 token 带来的有效前进速度提升。
+
+---
+
+## 进展 #17: 投机解码优化与基准工具增强（2026-05-09）
+
+**目标**: 以"少代码优先、允许到注意力内核级"为约束，制定 7B→32B speculative 路径追近 vLLM 部分性能的 ROI 改造路线，并按优先级落地第一批改动。
+
+### 17.1 Speculative CUDA Graph 覆盖增强（P0-1）
+
+**问题**: `SpeculativeDecoder` 里 draft 侧的 step / resync / final 三个前向路径各自组装 buffer/metadata，存在大量重复代码和临时张量构造；draft graph 仅按 `seq_id` 缓存、且只覆盖单步 decode，resync 和 final 无法命中 graph。
+
+**修改内容** (`nano_dist_spec/speculative.py`, +96 / -65):
+
+1. 抽出统一的 draft 前向入口 `_run_draft_forward(seq_id, start_pos, tokens, params)`：
+   - graph 路径：按 `seq_len`（而非 `seq_id`）缓存 draft graph，支持 n=1 和 n>1 复用。
+   - eager 路径：复用 `_resync_inp/_resync_pos/_resync_slots` 长期 buffer。
+2. `_draft_step_one` / `_resync_draft_batched` / `_draft_final_one` 全部改为调用 `_run_draft_forward`：
+   - 消除三套重复的 `compute_slot_mapping_into` + `fill_block_table_padded` + `InputMetadata` 构造。
+   - `resync` 和 `final` 新增 `params` 参数，使其可走 graph 路径。
+3. draft graph 缓存键从 `seq_id` 改为 `seq_len`：
+   - n=1 时保留 warmup 采样路径（`warmup_extra`）。
+   - n>1 时仅构图、不采样（resync 不需要采样输出）。
+
+**验证**: `python -m pytest tests/test_speculative.py -v` 全部通过（7/7）。
+
+### 17.2 基准工具 `--num-gpu-blocks` 参数
+
+**问题**: `profiler/bench.py` 的 spec 模式没有暴露 `num_gpu_blocks`，在 24GB 卡上自动估算会把 KV 吃满，导致双模型（7B+1.5B 或 32B+7B）OOM。
+
+**修改内容**:
+
+- `profiler/bench.py`: 新增共享参数 `--num-gpu-blocks`（默认 `None`）。
+- `profiler/bench_core.py`: `SharedArgs` 新增 `num_gpu_blocks: Optional[int]`；`_build_target_engine` 和 `run_spec` 中创建 `LLM` 时透传。
+- `profiler/nano_benchmark.sh`: 新增可配置变量 `NUM_GPU_BLOCKS=""`，非空时自动拼接到 `basic/spec` 命令。
+
+**验证**: `python profiler/bench.py spec ... --num-gpu-blocks 128` 正常执行，JSON 输出包含 `"num_gpu_blocks": 128`。
+
+### 17.3 `run_basic` 默认启用 CUDA Graph
+
+**问题**: `run_basic` 内部 `_build_target_engine(... use_cuda_graph=False)`，benchmark 的 baseline 未利用 graph 提速。
+
+**修改内容** (`profiler/bench_core.py`):
+
+- `_build_target_engine` 新增 `use_cuda_graph: bool = True` 参数。
+- `run_basic()` 默认走 `use_cuda_graph=True`。
+- `run_spec()` 的内部 baseline 已移除（见 17.4），不影响。
+
+### 17.4 `run_spec` 移除内部 baseline 跑分
+
+**问题**: `run_spec` 内部先加载一次 target-only baseline，再加载 target+draft，两次模型加载在 24GB 卡上容易 OOM；且外层 `nano_benchmark.sh` 已单独执行了 `basic` baseline。
+
+**修改内容** (`profiler/bench_core.py`):
+
+- 移除 `run_spec` 内的 `_build_target_engine` + `_bench_basic_prompt_set` baseline 测量。
+- 移除 sweep 中每项的 `speedup_vs_baseline` 计算。
+- 移除返回 JSON 里的顶层 `"baseline"` 字段。
+- 加速比由用户根据 `basic` JSON 与 `spec` JSON 自行计算。
+
+### 17.5 Random Prompt 对齐 vLLM
+
+**问题**: 原有 `make_token_ids` 使用固定英文故事重复填充，与 vLLM `bench throughput --random-input-len L --random-range-ratio 0` 的 i.i.d. 随机 token 模式不对齐，导致接受率虚高（固定 prompt 下 draft/target 几乎完全一致）。
+
+**修改内容** (`profiler/bench_core.py`, +80 / -16):
+
+1. 新增 `make_random_token_ids(tokenizer, length, rng)`：
+   - 在 `[0, vocab_size)` 均匀抽样，排除 BOS/EOS/PAD。
+   - 对齐 vLLM 的 synthetic prompt 语义。
+2. 新增 `_make_prompt_list(tokenizer, shared, rng)`：
+   - `prompt_mode="fixed"`: 原有行为（同一段文本重复）。
+   - `prompt_mode="random"`: 每个 prompt 独立采样。
+3. `SharedArgs` 新增 `prompt_mode: Literal["fixed", "random"] = "random"` 和 `bench_seed: int = 42`。
+4. `_bench_basic_prompt_set` / `_bench_spec_prompt_set` 改为接收 `prompts: Sequence[Sequence[int]]`，每条请求使用独立 prompt。
+5. `run_spec` 的 K 扫描对同一组 `prompts` 复用，保证不同 K 之间可比。
+6. `profiler/bench.py` 新增 `--prompt-mode {random,fixed}` 和 `--bench-seed` CLI 参数。
+
+### 17.6 SpecDecoding 指标对齐 vLLM
+
+**问题**: 原有 `draft_accept_rate_by_pos` 是前缀累积率（`count[pos] / num_rounds`），与 vLLM 的 "Per-position acceptance rate"（条件概率）不一致；且缺少 vLLM 的 `Mean acceptance length`、`Accepted/Drafted throughput` 等关键指标。
+
+**修改内容** (`profiler/bench_core.py`, `profiler/nano_benchmark.sh`):
+
+1. `_bench_spec_single` / `_bench_spec_prompt_set` 新增统计：
+   - `drafted_counts_by_pos[i]`: draft 循环实际走到位置 i 的轮次数（条件概率的分母）。
+   - `per_pos_accept_rate[i]`: `accept_by_pos[i] / drafted_by_pos[i]`，即 `P(accept at pos i | loop reached pos i)`。
+   - `mean_acceptance_length`: 每轮平均接受的 draft token 数。
+   - `accepted_throughput`: 被 target 接受的 draft token 吞吐 (tok/s)。
+   - `drafted_throughput`: draft 模型总产出 token 吞吐 (tok/s)。
+2. `nano_benchmark.sh` 的 `extract_spec_metrics` 输出格式对齐 vLLM：
+   ```
+   SpecDecoding metrics: Mean acceptance length: 3.96, Accepted throughput: 40.93 tokens/s, Drafted throughput: 69.22 tokens/s, Accepted: 411 tokens, Drafted: 695 tokens
+   Per-position acceptance rate: 0.727, 0.647, 0.547, 0.518, 0.518
+   ```
+
+### 17.7 Debug 脚本
+
+**新增** `profiler/debug_spec_accept_by_pos.py`：
+
+- 支持两种模式：
+  - `--from-json <spec.json>`: 只解析已有 bench JSON（不占 GPU）。
+  - `--target-model ... --draft-model ...`: 现场跑一轮并输出逐位分析。
+- 输出三种率：cumulative_rate（前缀累积）、conditional_rate（逐步条件）、per_pos_accept_rate（精确条件，来自 `drafted_counts_by_pos`）。
+- 打印 vLLM 风格的汇总指标。
+
+### 17.8 实测数据（7B target + 1.5B draft, random prompt）
+
+使用 `nano_benchmark.sh`（`NUM_GPU_BLOCKS=128`, `NUM_PROMPTS=5`, `INPUT_LEN=128`, `OUTPUT_LEN=256`, `PROMPT_MODE=random`）：
+
+| K | output tok/s | accept_rate | tokens_per_round | num_rounds |
+|---|---:|---:|---:|---:|
+| baseline | 54.71 | — | — | — |
+| 1 | 33.23 | 99.2% | 1.99 | 640 |
+| 2 | 37.78 | 98.8% | 2.98 | 320 |
+| 3 | 44.76 | 98.5% | 3.95 | 213 |
+| 4 | 51.23 | 98.1% | 4.92 | 160 |
+| 5 | 55.65 | 97.7% | 5.89 | 128 |
+| 6 | 59.91 | 97.4% | 6.84 | 110 |
+| 7 | 64.08 | 97.0% | 7.79 | 165 |
+
+**关键发现**:
+
+1. **接受率极高且几乎不随 pos 下降**: K=7 时 `Per-position acceptance rate` 七个位置都在 ~0.97，`conditional_rate` 全为 1.0。原因是 random prompt 在 7B/1.5B 上都是"无意义 token 序列"，draft 和 target 对这类输入的"续写"几乎没有分歧——两者都不太可能对纯随机 token 形成强偏好差异。
+2. **吞吐随 K 单调上升**: 因为接受率接近 100%，每轮多投入 K 步 draft 的成本几乎全被「更少轮数 / 更少固定编排开销」抵消。这与论文里"大 K 后期大量被拒"的典型曲线不一致，属于 workload 特性而非实现 bug。
+3. **K=7 spec (64 tok/s) 已超过 baseline (55 tok/s)**: 在高接受率 + 单流模式下，spec 的收益已经翻正。
+4. **与 vLLM K=4 最优（1.7x）的差异**: vLLM 使用真实对话数据（chat template），接受率会随 pos 显著下降；当前 random prompt 无法复现该曲线，需后续换真实数据验证。
+
+> ⚠️ **后续修正（见 #18/#19）**：上面四条结论其实是「last_token 漏写 target KV」off-by-one bug 的产物——target KV 整体被左移一位，导致 verify 时拿错位的 logits 与 draft 比较，于是首位接受率虚高、随 pos 单调上升、加速比不饱和。该 bug 修复后，曲线恢复成「先升后稳/略降」的典型形态，第一位接受率也降到与 vLLM 类似的范围。
+
+### 17.9 待做 / 下一步
+
+- [ ] 使用 chat template + 真实对话 prompt 重新跑 K-sweep，观察 `per_pos_accept_rate` 是否随 pos 下降。
+- [ ] P1: 替换 `decode_paged_attention` 教学实现为更高效内核（当前按 `max_ctx` 稠密展开，是与 vLLM 的主要结构差距）。
+- [ ] P2: 控制流微优化打包（`append_slots` 批量化、final 逻辑融合、减少 `.item()` 同步、自适应 K）。
+- [ ] 在更大显存或 TP 环境下验证 32B+7B 组合。
+
+---
+
+## 进展 #18: 投机解码 `last_token` 漏写 target KV 的 off-by-one Bug 诊断（2026-05-11）
+
+**背景**: #17.8 实测在 7B+1.5B 上观察到三条与论文 / vLLM 都不符的反常现象：
+
+1. **加速比随 K 单调上升**，没有出现典型的"先升后降"。
+2. **per-position 接受率随 pos 递增**（K=7 时 0.97 → 1.00），不是论文里随 pos 衰减。
+3. **第一位接受率异常高**（~0.97），远高于 vLLM 在同模型族 random prompt 下的水平。
+
+最初怀疑是 `nano_dist_spec/attention.py` 的路径分流问题——直觉是「verify 的 K-token forward 因为 `block_tables is not None` 走了 `decode_paged_attention`，而 decode 路径只检查 `pos < context_lens`，缺 query 间 causal mask，导致 K 个 query 互相能看见对方」。
+
+### 18.1 第一个假设被证伪：attention 路径其实是对的
+
+通读 `nano_dist_spec/model.py` 的 `Attention.attend()` 分流逻辑 + `nano_dist_spec/attention.py` 三条路径的实现，确认：
+
+- `seq_len == 1` → `decode_paged_attention`（无 causal mask 需求）。
+- `seq_len > 1 and block_tables is not None` → `extend_attention`（K-token verify 走这条）。
+- `extend_attention` 内部 `mask = q_pos[:, None] >= k_pos[None, :]`，**有正确的 causal mask**。
+
+所以"K 个 query 互相能看见对方"的假设不成立。验证后排除 attention 实现问题。
+
+### 18.2 真根因：verify 时 `last_token` 没写进 target KV
+
+回到 `nano_dist_spec/speculative.py:speculative_step` 的验证 forward 入口。原实现是：
+
+```python
+# 上一轮采样出来的 last_token（即 "上一轮 bonus 或首 token"）已经在 prompt 末尾，
+# 但只塞了 logits/probs，没塞回 target 的 KV cache。
+out = _run_target_forward(seq_id, start_pos=P, tokens=draft_tokens)  # K 个 draft token
+```
+
+`last_token` 是上一轮 step 的输出（或 `prefill` 的 `first_token`），它对应的 query/KV 从未在 target 上 forward 过：
+
+- prefix 已写到 KV 的位置: `[0, P-1]` 共 P 个。
+- 当前 step 写入: `[P, P+K-1]` 共 K 个 draft token。
+- **`last_token` 应该在 KV 的位置 `P`，但被跳过了**。
+
+结果是：每轮 verify 的 target 看到的 KV 比"真实历史"少一项，整条 KV 被左移一位。这造成：
+
+1. **首位接受率虚高**: target 在错位 KV 下产生的 logits，恰好对应 draft 已经看过的同一历史；两者预测高度一致，几乎必接受。
+2. **per-pos 随 pos 上升**: 错位累积，后期 KV「错的越久越自洽」（target 自己产生的错位 logits 会喂给下一步），与同样错位的 draft KV 越来越像。
+3. **加速比单调升**: 接受率因 bug 被拉到不合理高位，每轮接受越多 token，K 越大越赚——但这是假象，并非真实算法行为。
+
+### 18.3 为什么 `verify_draft_kv_against_groundtruth` 没抓到
+
+`speculative.py:657` 已有的调试函数会比对 draft 侧 KV 与"ground truth"。但 ground truth 自己也是从 `first_token` / `last_token` 拼出来的——同样漏了 `last_token`，于是与漏了 `last_token` 的 draft KV 自洽，校验通过。这也是为什么 bug 能潜伏这么久。
+
+### 18.4 诊断阶段结论
+
+- attention 实现没问题；问题在 `speculative_step` 的 verify 输入构造。
+- 修复方向：把 `last_token` 拼进 verify forward 的 token 序列，即用 `[last_token] + draft_tokens` 喂给 target，对应写 `P` 到 `P+K`（共 K+1 个位置）的 KV。
+- 同步需要修：buffer 容量 +1、cache rollback 边界 +1、ground truth 校验输入对齐、metric 取 logits 的索引偏移。
+
+修复实现与正确性回归见 #19，metric 含义引发的二次困惑与口径对齐见 #20。
+
+---
+
+## 进展 #19: K+1 token verify 重构与端到端正确性回归（2026-05-11）
+
+**目标**: 把 #18 定位的 off-by-one 修干净，并补一条"draft == target 时严格等价于 baseline greedy"的端到端测试，作为该路径以后任何重构的不变量保护。
+
+### 19.1 `speculative.py` 主重构：verify 输入扩到 K+1
+
+**修改内容** (`nano_dist_spec/speculative.py`):
+
+1. `__init__`: 三个 target 侧 buffer 容量从 `cap` 提到 `cap + 1`：
+   ```python
+   self._target_inp    = torch.empty(cap + 1, dtype=torch.long,  device=device)
+   self._target_pos    = torch.empty(cap + 1, dtype=torch.long,  device=device)
+   self._target_slots  = torch.empty(cap + 1, dtype=torch.long,  device=device)
+   ```
+   多出来的那一格用来承载本轮的 `last_token`。
+
+2. `prefill`: 返回从 `(first_token, saved_probs)` 简化为单值 `first_token: int`。`first_token` 不再立即写 KV，而是作为"pending"留到下一轮 spec step 由 verify forward 写入——彻底消灭"采到了但没塞 KV"这个错位状态。
+
+3. `speculative_step`:
+   - 签名移除 `saved_target_probs` 参数（不再需要跨步保存 probs）。
+   - verify 输入构造改成 `tokens = [last_token] + draft_tokens`，循环边界 `for _ in range(K + 1)`。
+   - 取 logits 时索引从 `[:K-1]` 改为 `[:K]`：现在 logits 序列长度是 K+1，前 K 个对应 verify K 个 draft token，第 K+1 个是"全接受时用来采 bonus"的 logits。
+   - rollback / resync 逻辑重写：
+     - 全接受路径: `target_mgr` / `draft_mgr` 各 `append_slots(seq_id, 1)`，再用 `_run_draft_forward` 把 `d_{K-1}` 写到 draft 的 P+K 位置，保证下一轮 draft 起点对齐。
+     - 拒绝路径（第 j 位拒绝）: 两个 KV manager 同步 rollback 到 `prefix_len + n_draft_accepted + 1`（多出来的"+1"就是被采纳了的 `last_token` 那一格）。
+   - 删除 `_resync_draft_batched` / `_draft_final_one` 两个辅助方法和原来的"final target/draft forward"分支——它们存在的唯一原因就是补 `last_token` 没写 KV 留下的窟窿，现在窟窿在源头堵死了，这些迂回路径不需要了。
+
+4. 同步联动:
+   - `nano_dist_spec/engine.py::_generate_speculative` 改成不传/不收 `saved_probs`。
+   - `profiler/bench_core.py::run_spec_benchmark` 调用点同步删掉 `saved_probs`。同时把内部调试用的 `ground_truth` 跟踪改正：`ground_truth = prompt_ids`（不再预先 append `first_token`），新增 `pending_token` 局部变量在每轮开头追加；这样 ground truth 与"`last_token` 还没写 KV"的真实状态对齐。
+   - `profiler/profile_spec.py::SEGMENT_NAMES` 删掉 `resync_draft` / `final`，新增 `draft_write_last`。
+
+### 19.2 新增端到端正确性测试
+
+**新增**: `tests/test_spec_end_to_end.py`
+
+核心思路：**draft 模型 = target 模型时，speculative decoding 必须 token-for-token 等于 baseline greedy**。这条不变量与具体接受率、具体采样温度都无关，是 spec 算法的最强正确性边界。
+
+```python
+@pytest.mark.parametrize("k", [1, 4])
+def test_spec_matches_baseline_when_draft_equals_target(k):
+    # 同一份权重、dtype=float32、greedy
+    llm_spec     = LLM(..., draft_model_path=SAME, num_speculative_tokens=k, dtype="float32")
+    llm_baseline = LLM(..., dtype="float32")
+    out_spec     = llm_spec.generate(prompt, max_new_tokens=N, temperature=0.0)
+    out_baseline = llm_baseline.generate(prompt, max_new_tokens=N, temperature=0.0)
+    assert out_spec == out_baseline   # 严格逐 token 相等
+```
+
+**dtype 注记**: 测试只在 `float32` 下断言严格等价。`bfloat16` 下会偶发首次分歧（实测在 pos 3 左右出现一个 token 偏差），原因不是算法 bug，而是数值精度：
+
+- baseline 跑的全是 `decode_paged_attention` (seq_len=1)。
+- spec 跑的混合 `extend_attention` (seq_len=K+1 verify) + `decode_paged_attention` (写 K 位置)。
+- 两条 kernel 路径的 reduce 顺序不同；在 `bf16` 7 位尾数下，logits 接近平局时 argmax 翻转。
+- 切到 `fp32` 后 reduce 误差量级远低于 logits 分辨率，结果一致。
+
+这是 nano 教学实现选择的精度/简洁性 trade-off，不是 bug；测试里有 docstring 注明。
+
+### 19.3 回归验证
+
+- 单元测试: `python -m pytest tests/ -v` 全绿，含新增 `test_spec_end_to_end.py`（float32 模式严格 token 一致）。
+- 7B + 1.5B 实测（`nano_spec_bench_logs_20260511_131227/bench_results/spec_*.json`, 修复后）:
+
+| K | output tok/s | accept_rate | tok/round | per_pos (vLLM 口径，见 #20) |
+|---|---:|---:|---:|---|
+| 1 | 18.99 | 96.76% | 1.97 | 0.968 |
+| 2 | 21.02 | 95.23% | 2.91 | 0.955, 0.950 |
+| 3 | 22.14 | 93.37% | 3.80 | 0.941, 0.932, 0.929 |
+| 4 | 22.88 | 91.67% | 4.67 | 0.924, 0.917, 0.913, 0.913 |
+| 5 | **23.48** | 90.43% | 5.52 | 0.914, 0.905, 0.901, 0.901, 0.901 |
+| 6 | 23.13 | 88.81% | 6.33 | 0.902, 0.892, 0.887, 0.887, 0.882, 0.877 |
+| 7 | 23.40 | 87.45% | 7.12 | 0.890, 0.878, 0.873, 0.873, 0.873, 0.867, 0.867 |
+
+修复后曲线特性（对照 #17.8 修复前）:
+
+1. **per-pos 接受率单调非递增** ✓（修复前是上升，K=7 末位 ≈ 1.0；修复后 K=7 末位 ≈ 0.867）。
+2. **第一位接受率从 ~0.97 降到 ~0.89–0.96**（同模型族 + random prompt 下仍偏高，是 workload 性质而非 bug）。
+3. **加速比"先升后稳"**: 7B+1.5B 上 K=5 达到 23.48 tok/s 后进入平台；H20 7B+32B 上更明显的"先升后降"（用户实测 K=3 峰值 17.87 tok/s 后回落到 K=7 的 15.94 tok/s），与论文 / vLLM 形态一致。
+4. **整体 accept_rate 随 K 平稳衰减**: K=1 96.76% → K=7 87.45%，单调下降，符合 K 越大 draft 越激进、被拒概率越高的直觉。
+
+---
+
+## 进展 #20: Per-position 接受率口径与命名对齐 vLLM（2026-05-11）
+
+**背景**: #19 修完之后，仍有一项"看起来不对"的现象残留——nano 输出的 `per_pos_accept_rate` 依然随 pos **递增**（例如 K=7 时 0.69 → 0.76 → 0.87 → 0.92 → 0.92 → 0.93 → 0.96），而 vLLM 运行时 metrics 显示的是单调**递减**。第一反应又是怀疑 bug，但深挖之后发现是 **nano 和 vLLM 在用同一个 label 报两种不同的口径**。
+
+### 20.1 两种口径的区别
+
+| 口径 | 定义 | 分母含义 | 单调性 |
+|---|---|---|---|
+| **无条件率** (vLLM "Per-position acceptance rate") | `accept_by_pos[i] / num_rounds` | 所有轮次 | 单调非递增（构造性的） |
+| **条件率** (nano 原 `per_pos_accept_rate`) | `accept_by_pos[i] / drafted_by_pos[i]` | 仅"走到 pos i"的轮次 | 可能随 pos **上升** |
+
+条件率上升源于 **survivorship bias**：能走到 pos 5 的，都是前 5 位都被接受的"幸运轮"；这些轮里 draft / target 高度一致，于是 pos 5 自身被接受的概率也高。两个口径都对，但描述的是不同的问题——
+
+- **vLLM 选无条件率**: 把它当"draft 在这个 K 配置下平均能跑多远"的指标，直接乘 num_rounds 就是该位置总接受数，便于吞吐推算。
+- **nano 原来选条件率**: 把它当"给定历史已接受，下一位还能接受多少"的诊断指标。在 K-sweep 比较时不直观。
+
+二者数据 `bench_core` 都已经在算（`draft_accept_rate_by_pos` 是无条件率，`per_pos_accept_rate` 是条件率），只是默认报告口径和字段命名都和 vLLM 错位。
+
+### 20.2 修改内容（命名 + 默认报告口径双对齐）
+
+1. **`profiler/bench_core.py`**: 在 `_bench_spec_single` 和 `_bench_spec_prompt_set` 两处:
+   - 将原 `per_pos_accept_rate`（条件率）**重命名为** `per_pos_accept_rate_conditional`，命名上明确"这是 nano 内部诊断指标，不是 vLLM 那个"。
+   - `draft_accept_rate_by_pos`（无条件率）字段名保留，并在输出 dict 边上加注释明确"这是 vLLM 对齐口径，按构造单调非递增，是默认展示项"。
+   - 同步删掉原先写在条件率上方的误导注释 `# vLLM: "Per-position acceptance rate"`。
+
+2. **`profiler/nano_benchmark.sh`** 的 `extract_spec_metrics`:
+   - 读取字段从 `per_pos_accept_rate` 切到 `draft_accept_rate_by_pos`。
+   - 输出行追加口径注解：
+     ```
+     Per-position acceptance rate: 0.890, 0.878, ...   # accept[i] / num_rounds, aligned with vLLM logs (monotonically non-increasing)
+     ```
+
+3. **`profiler/debug_spec_accept_by_pos.py`**:
+   - 修正 `_conditional_rates` docstring 里"条件率匹配 vLLM Per-position acceptance rate"的错误说明，改为明确指出 vLLM 报的是 `cumul_rate` 列（即 `count[i] / num_rounds`），条件率仅作为生存偏倚的诊断输出。
+   - 读取处加 fallback `row.get("per_pos_accept_rate_conditional", row.get("per_pos_accept_rate"))`，旧 JSON 仍可解析。
+
+### 20.3 验证
+
+- `profiler/nano_benchmark.sh` 中 `extract_spec_metrics` 用今天的实测 JSON 跑一遍：
+  ```
+  Per-position acceptance rate: 0.890, 0.878, 0.873, 0.873, 0.873, 0.867, 0.867
+    # accept[i] / num_rounds, aligned with vLLM logs (monotonically non-increasing)
+  ```
+  0.890 → 0.867 单调非递增，曲线形态与 vLLM 一致。
+- `debug_spec_accept_by_pos.py --from-json <old_json>` 在旧 schema（仅有 `per_pos_accept_rate`）下仍能输出三列 `cumul_rate / cond_rate`，向后兼容。
+
+### 20.4 最终命名对照
+
+| 含义 | nano JSON 字段（统一后） | nano 默认展示 |
+|---|---|---|
+| vLLM "Per-position acceptance rate"（无条件） | `draft_accept_rate_by_pos` | `nano_benchmark.sh` 的 `Per-position acceptance rate:` 行 |
+| nano 内部生存诊断（条件） | `per_pos_accept_rate_conditional` | 仅在 `debug_spec_accept_by_pos.py` 的 `cond_rate` 列 |
+
+> 教训记一笔：**指标名字和文档注释必须明确写清楚分母是什么**。今天这场误判（先以为是 bug 二次发作，再深挖才发现是命名歧义）完全可以靠把字段名从 `per_pos_accept_rate` 改成 `per_pos_accept_rate_conditional`、并在 dict 旁边写一行注释来提前避免。后续任何"按位 / 按 step / 按 token"的统计字段都应遵循「名字带分母提示 + 邻近注释写 vLLM 是否对齐」的规则。
+
+### 20.5 待做 / 下一步（接 #17.9）
+
+- [ ] 用 chat template + 真实对话 prompt 重跑 K-sweep，验证 first-pos 接受率是否会从当前的 ~0.89 进一步下降（同模型族 random prompt 上限仍偏高）。
+- [ ] 把"K-token verify forward 输入要包含 last_token"这一点写进 `nano_dist_spec/speculative.py` 顶部 docstring 的算法描述，避免未来重构再次踩同一个坑。
