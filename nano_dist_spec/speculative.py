@@ -111,7 +111,7 @@ class SpeculativeDecoder:
         draft_kv_mgr: KVCacheManager,
         num_speculative_tokens: int = 5,
         block_size: int = 16,
-        use_cuda_graph: bool = False,
+        use_cuda_graph: bool = True,
         max_seq_len: int = 4096,
     ):
         self.target = target_model
@@ -191,6 +191,7 @@ class SpeculativeDecoder:
         kv_list: List[Tuple[torch.Tensor, torch.Tensor]],
         seq_len: int,
         warmup_extra: Optional[Callable] = None,
+        fill_inputs: Optional[Callable[..., None]] = None,
     ) -> _CudaGraphState:
         """Capture a CUDA Graph for a single-sequence forward of *seq_len* tokens.
 
@@ -199,6 +200,11 @@ class SpeculativeDecoder:
             kv_list: pre-built KV layer list.
             seq_len: number of tokens in the forward pass.
             warmup_extra: optional callable(logits) run during warmup (e.g. sample).
+            fill_inputs: if set, called before warmup and again before capture to
+                populate graph input buffers with a **valid** decode/extend step.
+                Warmup/capture with all-zero ``context_lens`` / ``slot_mapping`` runs
+                extend_attention with prefix_len <= 0 and wrong KV writes, producing
+                a captured graph that does not match real verify semantics.
         """
         input_ids = torch.zeros((1, seq_len), dtype=torch.long, device=self.device)
         positions = torch.zeros((1, seq_len), dtype=torch.long, device=self.device)
@@ -213,6 +219,8 @@ class SpeculativeDecoder:
             context_lens=context_lens,
             block_size=self.block_size,
         )
+        if fill_inputs is not None:
+            fill_inputs(input_ids, positions, slot_mapping, block_tables, context_lens)
         warmup = torch.cuda.Stream(device=self.device)
         with torch.cuda.stream(warmup):
             for _ in range(2):
@@ -221,6 +229,9 @@ class SpeculativeDecoder:
                     warmup_extra(logits)
         torch.cuda.current_stream(self.device).wait_stream(warmup)
         torch.cuda.synchronize(self.device)
+
+        if fill_inputs is not None:
+            fill_inputs(input_ids, positions, slot_mapping, block_tables, context_lens)
 
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
@@ -235,15 +246,26 @@ class SpeculativeDecoder:
             logits=logits,
         )
 
-    def _get_target_graph(self, k: int) -> _CudaGraphState:
+    def _get_target_graph(
+        self,
+        k: int,
+        fill_inputs: Callable[..., None],
+    ) -> _CudaGraphState:
         st = self._target_graphs.get(k)
         if st is not None:
             return st
-        st = self._build_graph(self.target, self._kv_list_target, k)
+        st = self._build_graph(
+            self.target, self._kv_list_target, k, fill_inputs=fill_inputs,
+        )
         self._target_graphs[k] = st
         return st
 
-    def _get_draft_graph(self, seq_len: int, params: SamplingParams) -> _CudaGraphState:
+    def _get_draft_graph(
+        self,
+        seq_len: int,
+        params: SamplingParams,
+        fill_inputs: Callable[..., None],
+    ) -> _CudaGraphState:
         st = self._draft_graphs.get(seq_len)
         if st is not None:
             return st
@@ -253,7 +275,8 @@ class SpeculativeDecoder:
                 logits[:, -1, : self.shared_vocab_size], params,
             )
         st = self._build_graph(
-            self.draft, self._kv_list_draft, seq_len, warmup_extra=warmup_extra,
+            self.draft, self._kv_list_draft, seq_len,
+            warmup_extra=warmup_extra, fill_inputs=fill_inputs,
         )
         self._draft_graphs[seq_len] = st
         return st
@@ -278,22 +301,34 @@ class SpeculativeDecoder:
         k = len(tokens)
         if self._can_cuda_graph(params):
             try:
-                state = self._get_target_graph(k)
-                for i, t in enumerate(tokens):
-                    state.input_ids[0, i] = t
-                state.positions[0, :k].copy_(
-                    torch.arange(
-                        start_pos, start_pos + k,
-                        device=self.device, dtype=torch.long,
-                    ),
+                def _fill_target_buffers(
+                    inp: torch.Tensor,
+                    pos: torch.Tensor,
+                    sm: torch.Tensor,
+                    bt: torch.Tensor,
+                    cl: torch.Tensor,
+                ) -> None:
+                    for i, t in enumerate(tokens):
+                        inp[0, i] = t
+                    pos[0, :k].copy_(
+                        torch.arange(
+                            start_pos, start_pos + k,
+                            device=self.device, dtype=torch.long,
+                        ),
+                    )
+                    self.target_mgr.compute_slot_mapping_into(
+                        seq_id, start_pos, k, sm,
+                    )
+                    self.target_mgr.fill_block_table_padded(
+                        seq_id, bt, self._max_blocks,
+                    )
+                    cl[0] = self.target_mgr.context_lens[seq_id]
+
+                state = self._get_target_graph(k, _fill_target_buffers)
+                _fill_target_buffers(
+                    state.input_ids, state.positions,
+                    state.slot_mapping, state.block_tables, state.context_lens,
                 )
-                self.target_mgr.compute_slot_mapping_into(
-                    seq_id, start_pos, k, state.slot_mapping,
-                )
-                self.target_mgr.fill_block_table_padded(
-                    seq_id, state.block_tables, self._max_blocks,
-                )
-                state.context_lens[0] = self.target_mgr.context_lens[seq_id]
                 state.graph.replay()
                 return state.logits
             except Exception as exc:
@@ -399,22 +434,34 @@ class SpeculativeDecoder:
 
         if self._can_cuda_graph(params, draft=True):
             try:
-                st = self._get_draft_graph(n, params)
-                for i, t in enumerate(tokens):
-                    st.input_ids[0, i] = t
-                st.positions[0, :n].copy_(
-                    torch.arange(
-                        start_pos, start_pos + n,
-                        device=self.device, dtype=torch.long,
-                    ),
+                def _fill_draft_buffers(
+                    inp: torch.Tensor,
+                    pos: torch.Tensor,
+                    sm: torch.Tensor,
+                    bt: torch.Tensor,
+                    cl: torch.Tensor,
+                ) -> None:
+                    for i, t in enumerate(tokens):
+                        inp[0, i] = t
+                    pos[0, :n].copy_(
+                        torch.arange(
+                            start_pos, start_pos + n,
+                            device=self.device, dtype=torch.long,
+                        ),
+                    )
+                    self.draft_mgr.compute_slot_mapping_into(
+                        seq_id, start_pos, n, sm,
+                    )
+                    self.draft_mgr.fill_block_table_padded(
+                        seq_id, bt, self._max_blocks,
+                    )
+                    cl[0] = self.draft_mgr.context_lens[seq_id]
+
+                st = self._get_draft_graph(n, params, _fill_draft_buffers)
+                _fill_draft_buffers(
+                    st.input_ids, st.positions,
+                    st.slot_mapping, st.block_tables, st.context_lens,
                 )
-                self.draft_mgr.compute_slot_mapping_into(
-                    seq_id, start_pos, n, st.slot_mapping,
-                )
-                self.draft_mgr.fill_block_table_padded(
-                    seq_id, st.block_tables, self._max_blocks,
-                )
-                st.context_lens[0] = self.draft_mgr.context_lens[seq_id]
                 st.graph.replay()
                 return st.logits
             except Exception as exc:

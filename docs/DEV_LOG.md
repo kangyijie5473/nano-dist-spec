@@ -500,6 +500,7 @@ Target-only baseline: **26.6 tok/s**，TTFT 29.6 ms
 | 基准测量姿势 | bench 必须 bypass `LLM.generate()` 直接驱动 `LLMEngine` 原语，才能精确分离 TTFT / decode_tps；warmup 不可省（首次 run 因 CUDA context lazy init 会偏慢一截） |
 | Profiler | `torch.profiler` 的 Self CPU vs Self CUDA 总时长比能直接判断 host/GPU 谁拖后腿；Chrome trace 里 GPU stream **白缝多** = launch-bound。自定义段要镜像真实循环（如 `_decode_batch`），否则容易误判「slot 推导很慢」——实测瓶颈常在 `model_forward` 内海量 `cudaLaunchKernel`。PyTorch 2.9+ 段汇总里 GPU 时间用 `device_time_total`，旧版可能是 `cuda_time_total`，脚本里需兼容 |
 | 与 vLLM 对比 | 固定 ISL/OSL 时 vLLM `bench throughput` 须设 `--random-input-len/--random-output-len`；JSON 的 `tokens_per_second` 含 prompt，与 nano `aggregate_tps`（仅生成）对齐要用输出 token 数 / `elapsed_time`。nano decode graph 仅 `len(seqs)==1`，batch 模式 B≥2 无 graph 红利 |
+| CUDA Graph 构图 | **Warmup/capture 的输入必须与 `replay` 一致**：全零 `context_lens`/`slot_mapping` 会让 verify 的 `extend_attention` 在 eager warmup 与 capture 阶段处于错误 prefix 语义，捕获的图与生产前向不等价，可表现为接受率归零（见 Bug #21） |
 
 ---
 
@@ -1073,3 +1074,52 @@ def test_spec_matches_baseline_when_draft_equals_target(k):
 
 - [ ] 用 chat template + 真实对话 prompt 重跑 K-sweep，验证 first-pos 接受率是否会从当前的 ~0.89 进一步下降（同模型族 random prompt 上限仍偏高）。
 - [ ] 把"K-token verify forward 输入要包含 last_token"这一点写进 `nano_dist_spec/speculative.py` 顶部 docstring 的算法描述，避免未来重构再次踩同一个坑。
+
+---
+
+## Bug #21: 投机解码开启 CUDA Graph 后接受率掉到 0（eager 正常）
+
+**现象**（`bench.py spec` + `SpeculativeDecoder.use_cuda_graph=True`，greedy / `T=0`）：
+
+- `draft_accept_rate`、`total_draft_accepted` 等为 **0**；`drafted_counts_by_pos` 形如 `[N, 0, ...]`（第二位从未进入拒绝循环），等价于 **每个 round 在验证第一个 draft token 处必拒**。
+- 同一配置关闭 graph（eager verify）时接受率曲线正常。
+
+**根因**：`speculative.py::_build_graph` 在 **warmup（独立 CUDA stream）** 与 **`torch.cuda.graph` 捕获** 阶段，图输入缓冲区初始为全零：`context_lens=0`、`slot_mapping=0`、占位 `input_ids/positions` 等。
+
+1. **Warmup 不在 capturing 流上**：`extend_attention` 走 eager 分支，`prefix_lens = context_lens - seq_len` 在 `context_lens=0`、`seq_len=K+1` 时为 **负数**，`prefix_len > 0` 不成立 → **几乎不从 KV 读 prefix**，却在 **真实 slot（全零映射时反复写同一物理槽）** 上做多步前向，与真实 verify 语义完全不一致。
+2. **Capture 在 capturing 内**：走 `_extend_attention_cuda_graph_safe`，同样基于 **错误的 `context_lens`/slot 状态** 完成构图。
+3. 之后每次 `replay()` 前虽在 Python 侧把 `context_lens`、`slot_mapping` 等改成正确值，但 **已捕获的算子序列** 与「在错误状态下捕获」时的行为绑在一起；与 eager 下「每步用当前 manager 状态直接前向」不等价，导致 **target verify logits 与 draft 预测系统性对不齐**，greedy 比较下首位必拒 → 接受率 **0**。
+
+**本质一句话**：CUDA Graph 的 warmup/capture 必须在 **与生产 replay 相同的元数据** 上执行，不能用全零占位冒充一步 verify。
+
+**修复**（`nano_dist_spec/speculative.py`）：
+
+- 为 `_build_graph` 增加可选回调 **`fill_inputs(inp, pos, sm, bt, cl)`**：在 **两次 warmup 之前** 以及 **进入 `torch.cuda.graph` 捕获之前** 各调用一次，用与 `_run_target_forward` / `_run_draft_forward` 在 `replay` 前相同的逻辑写入真实 token、position、`compute_slot_mapping_into`、`fill_block_table_padded`、`context_lens`。
+- `_get_target_graph` / `_get_draft_graph` 首次构图时 **必须** 传入该回调；`replay` 前仍保留原有的显式 fill。
+
+**涉及文件**：`nano_dist_spec/speculative.py`（调试用 NDJSON 在确认修复后已移除，仅保留 `fill_inputs` 逻辑）。
+
+---
+
+## 进展 #22: `profiler/nano_benchmark.sh` 拆分 baseline / spec 并可单独执行
+
+**目标**：脚本维护与 CI/手工跑分场景下，有时只需 target-only baseline 或只需 spec sweep，不必每次都跑满全套。
+
+**改动**：
+
+1. 抽出 **`run_baseline`**：执行 `bench.py basic`，写 `baseline.log`，汇总 `extract_basic_metrics`。
+2. 抽出 **`run_spec_suite <start_idx> <total>`**：对 `K_VALUES` 循环执行 `bench.py spec`，进度号与总步数由调用方传入（`both` 时为 `2 .. N+1`，纯 `spec` 时为 `1 .. N`）。
+3. **第一个位置参数**选择模式（缺省 `both`）：
+   - `baseline` 或 **`base`**：只跑 baseline；
+   - `spec`：只跑 spec；
+   - `both`：先 baseline 再 spec（与历史默认行为一致）。
+4. **`--help` / `-h` / help**：打印用法；未知参数报错退出。
+5. `summary.log` 开场增加一行 **`Mode: ...`**，便于区分当次运行组合。
+
+**示例**：
+
+```bash
+./profiler/nano_benchmark.sh           # 或 both
+./profiler/nano_benchmark.sh baseline  # 或 base
+./profiler/nano_benchmark.sh spec
+```
