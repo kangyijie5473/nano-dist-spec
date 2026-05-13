@@ -2,9 +2,39 @@
 # ============================================================
 # nano-dist-spec speculative decoding benchmark script
 # 依次跑: baseline（单独 basic）+ spec（仅吞吐与投机指标；加速比请用 baseline JSON 自行对比）
+#
+# 用法:
+#   ./profiler/nano_benchmark.sh           # 默认: baseline + spec（全部 K）
+#   ./profiler/nano_benchmark.sh both
+#   ./profiler/nano_benchmark.sh baseline  # 仅 basic baseline
+#   ./profiler/nano_benchmark.sh spec      # 仅 spec（K_VALUES 扫描）
 # ============================================================
 
 set -u
+
+usage() {
+    echo "Usage: $0 [baseline|base|spec|both]"
+    echo "  baseline, base  只跑 target-only basic"
+    echo "  spec            只跑 speculative（K_VALUES 中每个 K 各一次）"
+    echo "  both            baseline 后跑全部 spec（默认）"
+}
+
+MODE_RAW="${1:-both}"
+MODE_LC=$(printf '%s' "${MODE_RAW}" | tr '[:upper:]' '[:lower:]')
+case "${MODE_LC}" in
+    baseline | base) MODE="baseline" ;;
+    spec) MODE="spec" ;;
+    both) MODE="both" ;;
+    -h | --help | help)
+        usage
+        exit 0
+        ;;
+    *)
+        echo "Unknown mode: ${MODE_RAW}" >&2
+        usage >&2
+        exit 1
+        ;;
+esac
 
 # ---------- 可配置参数 ----------
 TARGET_MODEL="/model/HuggingFace/deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"
@@ -154,9 +184,81 @@ print(
 PY
 }
 
+# ---------- baseline / spec 执行体 ----------
+run_baseline() {
+    local cur="${1:?}"
+    local total="${2:?}"
+    local baseline_log="${LOG_DIR}/baseline.log"
+
+    log_summary ""
+    log_summary ">>> [${cur}/${total}] Running BASELINE (no spec decode)..."
+    log_summary "Start time: $(date +"%Y-%m-%d %H:%M:%S")"
+
+    python "${BENCH_PY}" --out-dir "${OUT_DIR}" basic \
+        --model "${TARGET_MODEL}" \
+        --input-len "${INPUT_LEN}" \
+        --output-len "${OUTPUT_LEN}" \
+        --num-prompts "${NUM_PROMPTS}" \
+        --max-num-seqs "${MAX_NUM_SEQS}" \
+        --max-model-len "${MAX_MODEL_LEN}" \
+        --tensor-parallel-size "${TP_SIZE}" \
+        --num-gpu-blocks "${NUM_GPU_BLOCKS}" \
+        > "${baseline_log}" 2>&1
+
+    local baseline_exit=$?
+    local baseline_json
+    baseline_json=$(latest_json_file "basic")
+    log_summary "End time:   $(date +"%Y-%m-%d %H:%M:%S")"
+    log_summary "Exit code:  ${baseline_exit}"
+    log_summary "Result json: ${baseline_json:-N/A}"
+    log_summary "========== [BASELINE] =========="
+    extract_basic_metrics "${baseline_json}" | tee -a "${SUMMARY_LOG}"
+    log_summary "Log file: ${baseline_log}"
+}
+
+run_spec_suite() {
+    local start_idx="${1:?}"
+    local total="${2:?}"
+    local idx="${start_idx}"
+
+    for K in "${K_VALUES[@]}"; do
+        local spec_log="${LOG_DIR}/spec_k${K}.log"
+        log_summary ""
+        log_summary ">>> [${idx}/${total}] Running SPEC DECODE k=${K}..."
+        log_summary "Start time: $(date +"%Y-%m-%d %H:%M:%S")"
+
+        python "${BENCH_PY}" --out-dir "${OUT_DIR}" spec \
+            --target-model "${TARGET_MODEL}" \
+            --draft-model "${DRAFT_MODEL}" \
+            --input-len "${INPUT_LEN}" \
+            --output-len "${OUTPUT_LEN}" \
+            --num-prompts "${NUM_PROMPTS}" \
+            --max-num-seqs "${MAX_NUM_SEQS}" \
+            --max-model-len "${MAX_MODEL_LEN}" \
+            --tensor-parallel-size "${TP_SIZE}" \
+            --k-values "${K}" \
+            --num-gpu-blocks "${NUM_GPU_BLOCKS}" \
+            > "${spec_log}" 2>&1
+
+        local spec_exit=$?
+        local spec_json
+        spec_json=$(latest_json_file "spec")
+        log_summary "End time:   $(date +"%Y-%m-%d %H:%M:%S")"
+        log_summary "Exit code:  ${spec_exit}"
+        log_summary "Result json: ${spec_json:-N/A}"
+        log_summary "========== [SPEC k=${K}] =========="
+        extract_spec_metrics "${spec_json}" "${K}" | tee -a "${SUMMARY_LOG}"
+        log_summary "Log file: ${spec_log}"
+
+        idx=$((idx + 1))
+        sleep 5
+    done
+}
+
 # ---------- 开场打印 ----------
 log_summary "============================================================"
 log_summary "Nano Spec Decoding Benchmark - ${TIMESTAMP}"
+log_summary "Mode: ${MODE}"
 log_summary "Target: ${TARGET_MODEL}"
 log_summary "Draft:  ${DRAFT_MODEL}"
 log_summary "input_len=${INPUT_LEN}, output_len=${OUTPUT_LEN}, num_prompts=${NUM_PROMPTS}"
@@ -165,65 +267,21 @@ log_summary "num_gpu_blocks=${NUM_GPU_BLOCKS}"
 log_summary "log_dir=${LOG_DIR}"
 log_summary "============================================================"
 
-# ---------- 1. Baseline ----------
-BASELINE_LOG="${LOG_DIR}/baseline.log"
-log_summary ""
-log_summary ">>> [1/$((${#K_VALUES[@]} + 1))] Running BASELINE (no spec decode)..."
-log_summary "Start time: $(date +"%Y-%m-%d %H:%M:%S")"
+NUM_K="${#K_VALUES[@]}"
+TOTAL_BOTH=$((NUM_K + 1))
 
-python "${BENCH_PY}" --out-dir "${OUT_DIR}" basic \
-    --model "${TARGET_MODEL}" \
-    --input-len "${INPUT_LEN}" \
-    --output-len "${OUTPUT_LEN}" \
-    --num-prompts "${NUM_PROMPTS}" \
-    --max-num-seqs "${MAX_NUM_SEQS}" \
-    --max-model-len "${MAX_MODEL_LEN}" \
-    --tensor-parallel-size "${TP_SIZE}" \
-    --num-gpu-blocks "${NUM_GPU_BLOCKS}" \
-    > "${BASELINE_LOG}" 2>&1
-
-BASELINE_EXIT=$?
-BASELINE_JSON=$(latest_json_file "basic")
-log_summary "End time:   $(date +"%Y-%m-%d %H:%M:%S")"
-log_summary "Exit code:  ${BASELINE_EXIT}"
-log_summary "Result json: ${BASELINE_JSON:-N/A}"
-log_summary "========== [BASELINE] =========="
-extract_basic_metrics "${BASELINE_JSON}" | tee -a "${SUMMARY_LOG}"
-log_summary "Log file: ${BASELINE_LOG}"
-
-# ---------- 2. Spec decoding with k=1..7 ----------
-IDX=2
-for K in "${K_VALUES[@]}"; do
-    SPEC_LOG="${LOG_DIR}/spec_k${K}.log"
-    log_summary ""
-    log_summary ">>> [${IDX}/$((${#K_VALUES[@]} + 1))] Running SPEC DECODE k=${K}..."
-    log_summary "Start time: $(date +"%Y-%m-%d %H:%M:%S")"
-
-    python "${BENCH_PY}" --out-dir "${OUT_DIR}" spec \
-        --target-model "${TARGET_MODEL}" \
-        --draft-model "${DRAFT_MODEL}" \
-        --input-len "${INPUT_LEN}" \
-        --output-len "${OUTPUT_LEN}" \
-        --num-prompts "${NUM_PROMPTS}" \
-        --max-num-seqs "${MAX_NUM_SEQS}" \
-        --max-model-len "${MAX_MODEL_LEN}" \
-        --tensor-parallel-size "${TP_SIZE}" \
-        --k-values "${K}" \
-        --num-gpu-blocks "${NUM_GPU_BLOCKS}" \
-        > "${SPEC_LOG}" 2>&1
-
-    SPEC_EXIT=$?
-    SPEC_JSON=$(latest_json_file "spec")
-    log_summary "End time:   $(date +"%Y-%m-%d %H:%M:%S")"
-    log_summary "Exit code:  ${SPEC_EXIT}"
-    log_summary "Result json: ${SPEC_JSON:-N/A}"
-    log_summary "========== [SPEC k=${K}] =========="
-    extract_spec_metrics "${SPEC_JSON}" "${K}" | tee -a "${SUMMARY_LOG}"
-    log_summary "Log file: ${SPEC_LOG}"
-
-    IDX=$((IDX + 1))
-    sleep 5
-done
+case "${MODE}" in
+    baseline)
+        run_baseline 1 1
+        ;;
+    spec)
+        run_spec_suite 1 "${NUM_K}"
+        ;;
+    both)
+        run_baseline 1 "${TOTAL_BOTH}"
+        run_spec_suite 2 "${TOTAL_BOTH}"
+        ;;
+esac
 
 # ---------- 最终汇总 ----------
 log_summary ""

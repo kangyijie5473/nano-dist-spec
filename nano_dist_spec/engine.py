@@ -421,28 +421,25 @@ class LLM:
             prompt_ids = self.engine.tokenizer.encode(prompt, add_special_tokens=True)
             seq_id = 0
 
+            # Match profiler/bench_core._bench_spec_single: fresh graphs per request,
+            # then allocate KV for target + draft before prefill.
+            self._spec_decoder.reset_cuda_graph_runtime()
             self.engine.kv_mgr.allocate_seq(seq_id, len(prompt_ids))
             self._spec_decoder.draft_mgr.allocate_seq(seq_id, len(prompt_ids))
 
             prompt_tensor = torch.tensor([prompt_ids], device=self.engine.device)
-            first_token, saved_probs = self._spec_decoder.prefill(
-                seq_id, prompt_tensor, params,
-            )
+            first_token = self._spec_decoder.prefill(seq_id, prompt_tensor, params)
 
             generated = [first_token]
-            total_accepted = 0
-            total_draft = 0
 
             while len(generated) < params.max_tokens:
                 if generated[-1] == eos_id:
                     break
 
-                output, saved_probs = self._spec_decoder.speculative_step(
-                    seq_id, generated[-1], saved_probs, params,
+                output = self._spec_decoder.speculative_step(
+                    seq_id, generated[-1], params,
                 )
                 generated.extend(output.accepted_tokens)
-                total_accepted += output.num_accepted
-                total_draft += output.num_draft_tokens
 
             generated = generated[:params.max_tokens]
             text = self.engine.tokenizer.decode(generated, skip_special_tokens=True)
