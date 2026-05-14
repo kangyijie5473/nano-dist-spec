@@ -153,6 +153,7 @@ class Attention(nn.Module):
                 q, key_cache, value_cache,
                 metadata.block_tables, metadata.context_lens,
                 metadata.block_size, self.num_kv_groups,
+                narrow_to_context=metadata.decode_narrow_attn,
             )
         else:
             prefix_lens = metadata.context_lens - seq_len

@@ -115,6 +115,7 @@ class LLMEngine:
             block_tables=block_tables,
             context_lens=context_lens,
             block_size=self.block_size,
+            decode_narrow_attn=True,
         )
         return seq_ids, input_ids, positions, metadata
 
@@ -166,7 +167,7 @@ class LLMEngine:
         kv_list = [self.kv_cache.get_kv(i) for i in range(self.kv_cache.num_layers)]
         warmup = torch.cuda.Stream(device=self.device)
         with torch.cuda.stream(warmup):
-            for _ in range(2):
+            for _ in range(1):
                 logits = self.model(input_ids, positions, kv_list, metadata)
                 _ = sample(logits[:, -1, :], params)
         torch.cuda.current_stream(self.device).wait_stream(warmup)

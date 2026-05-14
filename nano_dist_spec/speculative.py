@@ -26,6 +26,7 @@ from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
+import torch.nn.functional as F
 from torch.profiler import record_function
 
 from .attention import InputMetadata
@@ -156,6 +157,7 @@ class SpeculativeDecoder:
         self._resync_inp = torch.zeros((1, cap), dtype=torch.long, device=self.device)
         self._resync_pos = torch.zeros((1, cap), dtype=torch.long, device=self.device)
         self._resync_slots = torch.zeros((cap,), dtype=torch.long, device=self.device)
+        self._draft_tok_gpu = torch.zeros((cap,), dtype=torch.long, device=self.device)
 
         # CUDA Graph caches — keyed by seq_len.
         self._target_graphs: Dict[int, _CudaGraphState] = {}
@@ -223,7 +225,7 @@ class SpeculativeDecoder:
             fill_inputs(input_ids, positions, slot_mapping, block_tables, context_lens)
         warmup = torch.cuda.Stream(device=self.device)
         with torch.cuda.stream(warmup):
-            for _ in range(2):
+            for _ in range(1):
                 logits = model(input_ids, positions, kv_list, meta)
                 if warmup_extra is not None:
                     warmup_extra(logits)
@@ -555,8 +557,7 @@ class SpeculativeDecoder:
             "VERIFY", seq_id=seq_id,
             range=f"[{prefix_len},{prefix_len + K}]", num_tokens=K + 1,
         )
-        for _ in range(K + 1):
-            self.target_mgr.append_slots(seq_id, 1)
+        self.target_mgr.append_slots(seq_id, K + 1)
 
         with record_function("verify_target_batch"):
             target_logits = self._run_target_forward(
@@ -566,14 +567,11 @@ class SpeculativeDecoder:
         # target_logits[i] = pred at pos prefix_len+i+1 given [last_token, d_0..d_{i-1}].
         #   - i in [0, K-1]: verifies draft_tokens[i]
         #   - i == K       : bonus distribution
-        target_probs_verify: List[torch.Tensor] = []
-        for i in range(K + 1):
-            target_probs_verify.append(
-                logits_to_probs(
-                    target_logits[:, i, : self.shared_vocab_size],
-                    params.temperature,
-                ).squeeze(0)
-            )
+        tgt_probs_batch: Optional[torch.Tensor] = None
+        if params.temperature != 0:
+            tv = target_logits[0, : K + 1, : self.shared_vocab_size].float()
+            tv = tv / max(params.temperature, 1e-10)
+            tgt_probs_batch = F.softmax(tv, dim=-1)
 
         # --- Reject / Accept ---
         accepted: List[int] = []
@@ -584,9 +582,11 @@ class SpeculativeDecoder:
                 # Greedy: choices[i] = target's greedy prediction at pos P+i+1
                 # given last_token + d_0..d_{i-1}. Accept iff equal to d_i.
                 choices = target_logits[0, :K, : self.shared_vocab_size].argmax(dim=-1)
-                draft_t = torch.tensor(draft_tokens, device=self.device, dtype=torch.long)
+                for j, t in enumerate(draft_tokens):
+                    self._draft_tok_gpu[j] = t
+                draft_t = self._draft_tok_gpu[:K]
                 eq = choices == draft_t
-                if bool(eq.all().item()):
+                if torch.equal(choices, draft_t):
                     accepted = list(draft_tokens)
                 else:
                     all_accepted = False
@@ -600,10 +600,11 @@ class SpeculativeDecoder:
                     )
             else:
                 for i in range(K):
+                    assert tgt_probs_batch is not None
                     ok, correction = rejection_sample(
                         draft_token=draft_tokens[i],
                         draft_prob=draft_probs_list[i][draft_tokens[i]].item(),
-                        target_probs=target_probs_verify[i],
+                        target_probs=tgt_probs_batch[i],
                         draft_probs_full=draft_probs_list[i],
                         temperature=params.temperature,
                     )
@@ -623,11 +624,13 @@ class SpeculativeDecoder:
                 tracer.on_spec_event("ACCEPT", pos=i, token=draft_tokens[i])
 
         if all_accepted:
-            bonus_probs = target_probs_verify[K]
             if params.temperature == 0:
-                bonus = int(bonus_probs.argmax(dim=-1).item())
+                bonus = int(
+                    target_logits[0, K, : self.shared_vocab_size].argmax(dim=-1).item(),
+                )
             else:
-                bonus = int(torch.multinomial(bonus_probs, num_samples=1).item())
+                assert tgt_probs_batch is not None
+                bonus = int(torch.multinomial(tgt_probs_batch[K], num_samples=1).item())
             accepted.append(bonus)
             tracer.on_spec_event("BONUS", token=bonus)
 

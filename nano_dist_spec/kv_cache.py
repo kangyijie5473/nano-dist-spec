@@ -98,9 +98,14 @@ class KVCacheManager:
         self.allocator = allocator
         self.block_tables: Dict[int, List[int]] = {}  # seq_id -> [phys_block_id, ...]
         self.context_lens: Dict[int, int] = {}         # seq_id -> current context length
+        # Device copy of block_tables[seq_id] for fill_block_table_padded (avoid list→GPU each call).
+        self._block_table_gpu: Dict[int, torch.Tensor] = {}
+        self._block_table_synced_len: Dict[int, int] = {}
 
     def allocate_seq(self, seq_id: int, num_tokens: int) -> None:
         """Allocate blocks for a new sequence of *num_tokens* (prompt length)."""
+        self._block_table_gpu.pop(seq_id, None)
+        self._block_table_synced_len.pop(seq_id, None)
         num_blocks = (num_tokens + self.block_size - 1) // self.block_size
         blocks = [self.allocator.allocate() for _ in range(num_blocks)]
         self.block_tables[seq_id] = blocks
@@ -153,6 +158,8 @@ class KVCacheManager:
         )
 
     def free_seq(self, seq_id: int) -> None:
+        self._block_table_gpu.pop(seq_id, None)
+        self._block_table_synced_len.pop(seq_id, None)
         freed: List[int] = []
         for blk in self.block_tables.pop(seq_id, []):
             self.allocator.free(blk)
@@ -222,10 +229,23 @@ class KVCacheManager:
         n = len(table)
         if n < max_blocks:
             dest[0, n:max_blocks].zero_()
-        if n > 0:
-            dest[0, :n].copy_(
-                torch.tensor(table, dtype=torch.long, device=dest.device),
+        if n == 0:
+            return
+        dev = dest.device
+        buf = self._block_table_gpu.get(seq_id)
+        synced = self._block_table_synced_len.get(seq_id, -1)
+        if buf is None or buf.device != dev or buf.numel() < n:
+            buf = torch.tensor(table, dtype=torch.long, device=dev)
+            self._block_table_gpu[seq_id] = buf
+            self._block_table_synced_len[seq_id] = n
+        elif n > synced:
+            buf[synced:n].copy_(
+                torch.tensor(table[synced:n], dtype=torch.long, device=dev),
             )
+            self._block_table_synced_len[seq_id] = n
+        elif n < synced:
+            self._block_table_synced_len[seq_id] = n
+        dest[0, :n].copy_(buf[:n])
 
     def get_block_table_tensor(
         self, seq_ids: List[int], device: torch.device

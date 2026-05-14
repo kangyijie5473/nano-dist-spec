@@ -100,6 +100,10 @@ class InputMetadata:
     block_tables: Optional[torch.Tensor] = None   # [batch, max_blocks_per_seq]
     context_lens: Optional[torch.Tensor] = None    # [batch] total ctx length incl. new tokens
     block_size: int = 16
+    #: When True (eager decode only), ``decode_paged_attention`` matmul is limited to
+    #: ``max(context_lens)`` keys instead of the full padded block-table span — invalid
+    #: under CUDA graph capture; speculative decode leaves this False.
+    decode_narrow_attn: bool = False
 
     @property
     def is_prefill(self) -> bool:
@@ -134,6 +138,7 @@ def decode_paged_attention(
     context_lens: torch.Tensor,
     block_size: int,
     num_kv_groups: int,
+    narrow_to_context: bool = False,
 ) -> torch.Tensor:
     """Paged attention for decode: gather KV from block-table, compute attention.
 
@@ -169,18 +174,29 @@ def decode_paged_attention(
     padded_k = key_cache[flat_slots].reshape(batch_size, max_ctx, num_kv_heads, head_dim)
     padded_v = value_cache[flat_slots].reshape(batch_size, max_ctx, num_kv_heads, head_dim)
 
+    use_len = max_ctx
+    if (
+        narrow_to_context
+        and padded_k.is_cuda
+        and not torch.cuda.is_current_stream_capturing()
+    ):
+        use_len = int(context_lens.max().item())
+        use_len = max(1, min(use_len, max_ctx))
+        padded_k = padded_k[:, :use_len]
+        padded_v = padded_v[:, :use_len]
+
     # Transpose -> [batch, num_kv_heads, max_ctx, head_dim]
     k = padded_k.transpose(1, 2)
     v = padded_v.transpose(1, 2)
     k, v = expand_kv_for_gqa(k, v, num_kv_groups)
 
     # Build attention mask for variable context lengths
-    pos_range = torch.arange(max_ctx, device=device).unsqueeze(0)       # [1, max_ctx]
+    pos_range = torch.arange(use_len, device=device).unsqueeze(0)       # [1, use_len]
     attn_mask = (pos_range >= context_lens.unsqueeze(1))                 # [batch, max_ctx]
     attn_mask = attn_mask[:, None, None, :]                              # [batch, 1, 1, max_ctx]
 
     scale = 1.0 / math.sqrt(head_dim)
-    attn_weights = torch.matmul(q, k.transpose(-2, -1)) * scale         # [batch, heads, 1, max_ctx]
+    attn_weights = torch.matmul(q, k.transpose(-2, -1)) * scale         # [batch, heads, 1, use_len]
     attn_weights = attn_weights.masked_fill(attn_mask, float("-inf"))
     attn_weights = F.softmax(attn_weights, dim=-1)
     return torch.matmul(attn_weights, v)
